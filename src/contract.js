@@ -1,0 +1,58 @@
+// The contract every decision kind implements, and small helpers they share. See
+// docs/design.md §3 for the full specification.
+//
+// A kind module exports one frozen object:
+//   name                                   one of KINDS (defaults.js)
+//   normalize(input, cfg) -> input          pure; validates, applies defaults, returns a NEW
+//                                           object; throws TypeError on bad input
+//   prepare?(input, cfg, deps) -> input     async; IO only through `deps`; returns a NEW object
+//   plan(input, cfg) -> {settled: Verdict}  the rules settle it, no Luna call
+//                    | {state, questions, ctx}
+//   interpret(answers, ctx, cfg) -> Verdict answers keyed by name (answersByName); throws on a
+//                                           malformed answer
+//   heuristic(input, cfg) -> Verdict        rules-only answer, same result shape as interpret
+//   gate?(luna, rules, input, cfg) -> Verdict   rules that may override Luna (default: luna)
+//   finalize?(verdict, input, cfg, deps) -> Verdict  applies effects; async allowed
+//   summarize(result) -> string             one short line for the ledger and CLI
+//
+// Verdict = { result: object, confidence: number|null, reasons: string[], source?: string }
+// The engine sets `source` ('settled' | 'luna' | 'rules' | 'luna+rules'); gate sets
+// 'luna+rules' when its rules changed Luna's result.
+//
+// deps (built by the engine):
+//   store                 memory store (src/memory/store.js createMemoryStore)
+//   loadCatalog(dirs)     skills catalog (src/skills/catalog.js), cached by the engine
+//   repoIndex(root)       repository index (src/index/repo.js createRepoIndex), cached
+
+/** A verdict object. */
+export function verdict(result, confidence, reasons, source) {
+  return { result, confidence: confidence ?? null, reasons: [...(reasons ?? [])], ...(source ? { source } : {}) };
+}
+
+/** How decided a probability is: 1 at 0 or 1, 0.5 at 0.5. */
+export function certainty(p) {
+  return Math.max(p, 1 - p);
+}
+
+/** Mean of numbers, or null for none. */
+export function mean(nums) {
+  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+}
+
+/** Throws TypeError unless `v` is a non-empty string; returns it trimmed. */
+export function requireText(v, field) {
+  if (typeof v !== 'string' || !v.trim()) throw new TypeError(`${field} must be a non-empty string`);
+  return v.trim();
+}
+
+/** Indexed question/state ids: prefix + position, e.g. s0, s1 (valid question names). */
+export function indexId(prefix, i) {
+  return `${prefix}${i}`;
+}
+
+// Words that mark a hard or deep request, English and Chinese. Shared by route and others.
+export const HARD_TASK = /\b(design|architect|architecture|refactor|race|deadlock|concurren|security|vulnerab|prove|proof|optimi[sz]e|performance|migrat|why|root cause|debug|investigate)\b|設計|架構|重構|除錯|根因|為什麼|為何|優化|效能|安全|並行|遷移/i;
+export const DEEP_QUESTION = /\b(how (does|do|did|is|are|come)|explain (how|why)|in depth|deep dive|trade-?offs?|algorithm|complexity|analy[sz]e|analysis|compare|comparison)\b|深入|原理|分析|比較|權衡|取捨|演算法|複雜度|推導|證明|怎麼運作|如何運作|運作機制/i;
+export const GREETING = /^\s*(hi|hello|hey|yo|thanks|thank you|ok|okay|你好|嗨|謝謝|好的?|收到)\W*$/i;
+// A secret-looking string: never stored in memory, never sent in a memory_write state.
+export const SECRET = /\b(sk-[A-Za-z0-9_-]{16,}|sk-or-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)|\b(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*\S{6,}|密碼\s*[:：=]\s*\S+/i;
