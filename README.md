@@ -10,6 +10,8 @@ One decision layer for coding-agent harnesses. OpenAI's Luna (`gpt-6-luna`, Deci
 
 Node.js ≥ 22.15，ESM，**零依賴**（`package.json` 沒有 dependencies，不需要 `npm install`）。
 
+第一次使用可先看 [繁體中文使用說明](docs/usage.zh-TW.md)，依序完成離線試跑、金鑰設定與 Claude Code／Codex 的 MCP 接線。
+
 ## 目錄
 
 1. [這是什麼](#1-這是什麼)
