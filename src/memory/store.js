@@ -2,8 +2,12 @@
 // re-reads the file, so another store or process on the same file always sees the latest
 // records. Writes go to a temp file in the same folder that is renamed over the file, so a crash
 // never leaves a half-written store. A line that cannot be read is skipped and reported in
-// `warnings`; the next write keeps only the valid records. A text that looks like a secret
-// (contract SECRET) is refused on the way in and skipped on the way out.
+// `warnings`; the next write keeps only the valid records, and appends the skipped lines to
+// `<file>.rejected` first. A text that looks like a secret (contract SECRET) is refused on the way
+// in and skipped on the way out, and a skipped line that holds one keeps no text in `.rejected`.
+// Every read-modify-write holds `<file>.lock` (created exclusively), so several processes on one
+// store do not lose each other's records. A lock older than LOCK_STALE_MS is taken to be left by a
+// dead process and is removed.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,6 +21,17 @@ const DEFAULT_SOURCE = 'user';
 const DEFAULT_K = 10;
 const SECRET_REFUSAL = 'memory: refusing to store a text that looks like a secret';
 const STRING_FIELDS = ['source', 'created', 'updated'];
+const LOCK_SUFFIX = '.lock';
+const REJECTED_SUFFIX = '.rejected';
+const LOCK_WAIT_MS = 2000;
+const LOCK_STALE_MS = 10000;
+const LOCK_RETRY_MS = 10;
+// On Windows a rename, a delete or an exclusive create is refused with these codes while another
+// process has the file open or is still deleting it. Such refusals are retried.
+const BUSY_CODES = ['EPERM', 'EBUSY', 'EACCES'];
+const BUSY_ATTEMPTS = 5;
+const BUSY_RETRY_MS = 20;
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 
 const copy = (record) => ({ ...record });
 
@@ -85,41 +100,158 @@ function parseLine(line) {
 
 function readText(file) {
   try {
-    return fs.readFileSync(file, 'utf8');
+    return retryBusy(() => fs.readFileSync(file, 'utf8'));
   } catch (err) {
     if (err.code === 'ENOENT') return '';
     throw new Error(`memory: cannot read ${file}: ${err.message}`);
   }
 }
 
-/** The valid records in file order, and a warning for each line that was skipped. */
+/** The valid records in file order, and each line that was skipped (with its raw text). */
 function readRecords(file) {
   const records = [];
-  const warnings = [];
+  const skipped = [];
   const ids = new Set();
   readText(file).replace(/^﻿/, '').split(/\r?\n/).forEach((line, i) => {
     if (!line.trim()) return;
     const { record, problem } = parseLine(line);
     const duplicate = record && ids.has(record.id);
     if (problem || duplicate) {
-      warnings.push({ line: i + 1, error: problem ?? `duplicate id ${record.id}` });
+      skipped.push({ line: i + 1, error: problem ?? `duplicate id ${record.id}`, raw: line });
     } else {
       ids.add(record.id);
       records.push(record);
     }
   });
-  return { records, warnings };
+  return { records, skipped };
 }
 
-/** Writes the records to a temp file beside `file`, then renames it over `file`. */
+/** Blocks the thread for `ms` milliseconds without a busy loop. */
+function sleep(ms) {
+  Atomics.wait(SLEEP_CELL, 0, 0, ms);
+}
+
+/** Runs `fn`, retried while it is refused with a BUSY_CODES code; the last refusal is rethrown. */
+function retryBusy(fn) {
+  let attempt = 1;
+  for (;;) {
+    try {
+      return fn();
+    } catch (err) {
+      if (!BUSY_CODES.includes(err.code) || attempt >= BUSY_ATTEMPTS) throw err;
+      attempt += 1;
+      sleep(BUSY_RETRY_MS);
+    }
+  }
+}
+
+/** The file's stats, or null when it is absent or being deleted (the caller looks again). */
+function statOrNull(p) {
+  try {
+    return fs.statSync(p);
+  } catch (err) {
+    if (err.code === 'ENOENT' || BUSY_CODES.includes(err.code)) return null;
+    throw new Error(`memory: cannot inspect ${p}: ${err.message}`);
+  }
+}
+
+/**
+ * Creates the lock file exclusively. Returns `{ fd }`, or `{ busy: code }` while another holder
+ * has the lock (EEXIST) or Windows still refuses the name (a lock being deleted: EPERM).
+ */
+function tryCreateLock(lockPath) {
+  try {
+    return { fd: fs.openSync(lockPath, 'wx') };
+  } catch (err) {
+    if (err.code === 'EEXIST' || BUSY_CODES.includes(err.code)) return { busy: err.code };
+    throw new Error(`memory: cannot create lock ${lockPath}: ${err.message}`);
+  }
+}
+
+/**
+ * Removes the lock when it is older than LOCK_STALE_MS. The file is looked at twice and removed
+ * only when both looks see the same file, so a lock taken by a live holder in between is kept.
+ */
+function removeIfStale(lockPath) {
+  const seen = statOrNull(lockPath);
+  if (!seen || Date.now() - seen.mtimeMs < LOCK_STALE_MS) return;
+  const again = statOrNull(lockPath);
+  if (again && again.ino === seen.ino && again.mtimeMs === seen.mtimeMs) {
+    retryBusy(() => fs.rmSync(lockPath, { force: true }));
+  }
+}
+
+/** Takes the lock of `file`, waiting up to LOCK_WAIT_MS. Returns the handle that releases it. */
+function acquireLock(file) {
+  const lockPath = `${file}${LOCK_SUFFIX}`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const attempt = tryCreateLock(lockPath);
+    if (attempt.fd !== undefined) return { fd: attempt.fd, lockPath };
+    removeIfStale(lockPath);
+    if (Date.now() >= deadline) {
+      throw new Error(`memory: ${file} is locked by another process or refused (waited ${LOCK_WAIT_MS} ms; last refusal ${attempt.busy})`);
+    }
+    sleep(LOCK_RETRY_MS);
+  }
+}
+
+/** Closes and removes the lock file, even when closing fails. */
+function releaseLock({ fd, lockPath }) {
+  try {
+    fs.closeSync(fd);
+  } finally {
+    retryBusy(() => fs.rmSync(lockPath, { force: true }));
+  }
+}
+
+/** Runs `fn` while holding the lock of `file`. */
+function withLock(file, fn) {
+  const lock = acquireLock(file);
+  try {
+    return fn();
+  } finally {
+    releaseLock(lock);
+  }
+}
+
+/** The skipped lines as entries for `<file>.rejected`. A line that holds a secret keeps no text. */
+function rejectedEntries(skipped, at) {
+  return skipped.map(({ line, error, raw }) => ({ at, line, error, raw: SECRET.test(raw) ? null : raw }));
+}
+
+/** Appends the skipped lines to `<file>.rejected`; the file is not touched when there are none. */
+function appendRejected(file, skipped, at) {
+  if (skipped.length === 0) return;
+  const body = rejectedEntries(skipped, at).map((entry) => `${JSON.stringify(entry)}\n`).join('');
+  fs.appendFileSync(`${file}${REJECTED_SUFFIX}`, body, 'utf8');
+}
+
+/**
+ * A read-modify-write under the lock. `change(records)` returns `{ records, result }`: `records` is
+ * the list to write, or null to leave the file alone. Skipped lines are kept in `.rejected` first.
+ */
+function mutate(file, stamp, change) {
+  return withLock(file, () => {
+    const { records, skipped } = readRecords(file);
+    const next = change(records);
+    if (next.records) {
+      appendRejected(file, skipped, stamp());
+      writeRecords(file, next.records);
+    }
+    return next.result;
+  });
+}
+
+/** Writes the records to a temp file beside `file`, then renames it over `file`. Call under the lock. */
 function writeRecords(file, records) {
   const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   const body = records.map((r) => `${JSON.stringify(r)}\n`).join('');
   try {
     fs.writeFileSync(tmp, body, 'utf8');
-    fs.renameSync(tmp, file);
+    retryBusy(() => fs.renameSync(tmp, file));
   } catch (err) {
     try {
       fs.rmSync(tmp, { force: true });
@@ -164,7 +296,7 @@ export function createMemoryStore(file, { now = () => new Date() } = {}) {
   return Object.freeze({
     /** Lines skipped by the latest read of the file. */
     get warnings() {
-      return load().warnings.map(copy);
+      return load().skipped.map(({ line, error }) => ({ line, error }));
     },
     /** Every valid record, as copies. */
     list() {
@@ -185,28 +317,28 @@ export function createMemoryStore(file, { now = () => new Date() } = {}) {
     add(input) {
       const { type, text, source = DEFAULT_SOURCE } = requireObject(input, 'add');
       const fields = { type: requireType(type), text: checkedText(text), source: requireSource(source) };
-      const { records } = load();
-      const at = stamp();
-      const record = { id: newId(records), ...fields, created: at, updated: at };
-      writeRecords(file, [...records, record]);
-      return copy(record);
+      return mutate(file, stamp, (records) => {
+        const at = stamp();
+        const record = { id: newId(records), ...fields, created: at, updated: at };
+        return { records: [...records, record], result: copy(record) };
+      });
     },
     /** Changes the text and/or type of a record and bumps `updated`. Unknown id: Error. */
     update(id, patch) {
       const changes = patchOf(patch ?? {});
-      const { records } = load();
-      const index = records.findIndex((r) => r.id === id);
-      if (index < 0) throw new Error(`memory: unknown id "${id}"`);
-      const next = { ...records[index], ...changes, updated: stamp() };
-      writeRecords(file, records.map((r, i) => (i === index ? next : r)));
-      return copy(next);
+      return mutate(file, stamp, (records) => {
+        const index = records.findIndex((r) => r.id === id);
+        if (index < 0) throw new Error(`memory: unknown id "${id}"`);
+        const next = { ...records[index], ...changes, updated: stamp() };
+        return { records: records.map((r, i) => (i === index ? next : r)), result: copy(next) };
+      });
     },
     /** Removes a record; false when no record has this id (the file is then left alone). */
     remove(id) {
-      const { records } = load();
-      if (!records.some((r) => r.id === id)) return false;
-      writeRecords(file, records.filter((r) => r.id !== id));
-      return true;
+      return mutate(file, stamp, (records) => {
+        if (!records.some((r) => r.id === id)) return { records: null, result: false };
+        return { records: records.filter((r) => r.id !== id), result: true };
+      });
     },
   });
 }

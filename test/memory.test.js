@@ -9,10 +9,18 @@ import { answersByName } from '../src/luna/answers.js';
 import { createMemoryStore } from '../src/memory/store.js';
 import { memoryRecall, memoryWrite, guessType, REMEMBER } from '../src/domains/memory.js';
 import { MEMORY_TYPES } from '../src/defaults.js';
+import { similarity } from '../src/text.js';
 import { fakeLuna, choice, predicate } from './helpers/fakeLuna.js';
 
 const FIXED = new Date('2026-01-02T03:04:05.000Z');
 const PNPM_RULE = 'always use pnpm for package installs in this repo';
+// Distinct, non-stop latin words: a text of n of them against a text of the same n plus one
+// more word has Jaccard similarity exactly n / (n + 1), which pins the threshold boundaries.
+const WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet',
+  'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango', 'uniform',
+  'victor', 'whiskey', 'xray', 'yankee', 'zulu'];
+const ALREADY_STORED_SIMILARITY = 0.95;
+const DUPLICATE_SIMILARITY = 0.8;
 
 /** A config over a fresh home folder, a store on it, and the deps the kinds need. */
 async function withWorld(overrides, fn) {
@@ -373,5 +381,59 @@ test('the kind objects are frozen and no step mutates its input', async () => {
     memoryRecall.plan(recallInput, cfg);
     memoryRecall.heuristic(recallInput, cfg);
     assert.equal(JSON.stringify(recall), recallSnapshot);
+  });
+});
+
+// ------------------------------------------------ boundaries (threshold equality)
+
+test('memory_write keeps an observation whose durable answer is exactly durableThreshold, and skips one just under it', async () => {
+  await withWorld({}, async ({ cfg, deps }) => {
+    const threshold = cfg.memory.durableThreshold;
+    const observation = 'Ship the v2 release on Friday';
+    const decide = async (durable) => {
+      const plan = memoryWrite.plan(await prepared(memoryWrite, { observation }, cfg, deps), cfg);
+      const fake = fakeLuna({ predicates: { durable }, choices: { action: 'save_new', type: 'project' } });
+      return memoryWrite.interpret(await askFake(memoryWrite, plan, cfg, fake), plan.ctx, cfg).result.action;
+    };
+    assert.equal(await decide(threshold), 'save_new');
+    assert.equal(await decide(threshold - 0.01), 'skip');
+  });
+});
+
+test('memory_write settles an observation at similarity exactly 0.95 as already stored, and asks Luna just below it', async () => {
+  await withWorld({}, async ({ cfg, store, deps }) => {
+    const stored = `${WORDS.slice(0, 19).join(' ')} extra`;
+    const rec = store.add({ type: 'user', text: stored });
+    const at = WORDS.slice(0, 19).join(' ');
+    const below = WORDS.slice(0, 18).join(' ');
+    assert.equal(similarity(at, stored), ALREADY_STORED_SIMILARITY);
+    assert.equal(similarity(below, stored), 0.9);
+    const settled = memoryWrite.plan(await prepared(memoryWrite, { observation: at }, cfg, deps), cfg).settled;
+    assert.deepEqual([settled.result.action, settled.reasons], ['skip', [`already stored as ${rec.id}`]]);
+    const asked = memoryWrite.plan(await prepared(memoryWrite, { observation: below }, cfg, deps), cfg);
+    assert.equal(asked.settled, undefined);
+    assert.ok(asked.questions.some((q) => q.name === 'action'));
+  });
+});
+
+test('memory_write heuristic updates the similar memory at similarity exactly duplicateSimilarity (0.8)', async () => {
+  await withWorld({}, async ({ cfg, store, deps }) => {
+    assert.equal(cfg.memory.duplicateSimilarity, DUPLICATE_SIMILARITY);
+    const rec = store.add({ type: 'user', text: `${WORDS.slice(0, 4).join(' ')} extra` });
+    const same = WORDS.slice(0, 4).join(' ');
+    assert.equal(similarity(same, rec.text), DUPLICATE_SIMILARITY);
+    const dup = memoryWrite.heuristic(await prepared(memoryWrite, { observation: same }, cfg, deps), cfg).result;
+    assert.deepEqual([dup.action, dup.targetId], ['update', rec.id]);
+  });
+});
+
+test('memory_write heuristic does not update at similarity 0.75, just below duplicateSimilarity', async () => {
+  await withWorld({}, async ({ cfg, store, deps }) => {
+    const rec = store.add({ type: 'user', text: `${WORDS.slice(0, 3).join(' ')} extra` });
+    const near = WORDS.slice(0, 3).join(' ');
+    assert.equal(similarity(near, rec.text), 0.75);
+    const result = memoryWrite.heuristic(await prepared(memoryWrite, { observation: near }, cfg, deps), cfg).result;
+    assert.equal(result.action, 'skip');
+    assert.equal(result.targetId, null);
   });
 });

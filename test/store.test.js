@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,16 @@ function withDir(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-store-'));
   try {
     return fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** As withDir, for a callback that awaits (child processes). */
+async function withDirAsync(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-store-'));
+  try {
+    return await fn(dir);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -273,5 +284,226 @@ test('an unreadable store (a folder in place of the file) is an error, not an em
   withDir((dir) => {
     const store = createMemoryStore(dir, { now: () => FIXED });
     assert.throws(() => store.list(), /cannot read/);
+  });
+});
+
+// ------------------------------------------------ cross-process lock, rename retry, rejected lines
+
+const WORKERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+const RECORDS_PER_WORKER = 5;
+const WORKER_TIMEOUT_MS = 30000;
+const LOCK_WAIT_MS = 2000; // the lock wait limit in store.js
+const STALE_AGE_MS = 60000; // older than the ten-second stale limit
+const RENAME_ATTEMPTS = 5;
+const RETRIED_CODES = ['EPERM', 'EBUSY', 'EACCES'];
+// The child script: argv after -e is [storeUrl, file, label, count].
+const WORKER_SCRIPT = `
+  const [storeUrl, file, label, count] = process.argv.slice(1);
+  const { createMemoryStore } = await import(storeUrl);
+  const store = createMemoryStore(file);
+  for (let i = 0; i < Number(count); i += 1) store.add({ type: 'user', text: \`worker \${label} item \${i}\` });
+`;
+const STORE_URL = new URL('../src/memory/store.js', import.meta.url).href;
+
+/** Runs one child node process that adds `count` records to `file`; resolves with its outcome. */
+function runWorker(file, label, count) {
+  return new Promise((resolve) => {
+    const args = ['--input-type=module', '-e', WORKER_SCRIPT, STORE_URL, file, label, String(count)];
+    execFile(process.execPath, args, { timeout: WORKER_TIMEOUT_MS }, (error, stdout, stderr) => {
+      resolve({ error, stderr });
+    });
+  });
+}
+
+/** Sets a file's modification time to `ageMs` in the past. */
+function ageFile(file, ageMs) {
+  const at = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, at, at);
+}
+
+/** The parsed lines of a JSONL file. */
+function readJsonl(file) {
+  return fs.readFileSync(file, 'utf8').trimEnd().split('\n').map((l) => JSON.parse(l));
+}
+
+/** An error as a rename refusal with the given code. */
+function refusal(code) {
+  return Object.assign(new Error(`refused: ${code}`), { code });
+}
+
+test('six processes adding five records each to one file leave exactly thirty valid records and no error', async () => {
+  await withDirAsync(async (dir) => {
+    const file = path.join(dir, FILE);
+    const runs = await Promise.all(WORKERS.map((label) => runWorker(file, label, RECORDS_PER_WORKER)));
+    for (const { error, stderr } of runs) assert.equal(error, null, stderr);
+    const store = createMemoryStore(file);
+    assert.equal(store.list().length, WORKERS.length * RECORDS_PER_WORKER);
+    assert.deepEqual(store.warnings, []);
+    assert.equal(new Set(store.list().map((r) => r.id)).size, WORKERS.length * RECORDS_PER_WORKER);
+    assert.equal(fs.existsSync(`${file}.lock`), false, 'the lock is released after the last write');
+  });
+});
+
+test('a lock held by another process makes a write wait, then fail, and leaves the store and the lock alone', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, ''); // fresh: it stays younger than the stale limit for the whole wait
+    const started = Date.now();
+    assert.throws(() => storeIn(dir).add({ type: 'user', text: 'Blocked write' }), /locked by another process/);
+    assert.ok(Date.now() - started >= LOCK_WAIT_MS - 100, 'the write waited before it gave up');
+    assert.equal(fs.existsSync(lock), true);
+    assert.equal(fs.existsSync(file), false);
+  });
+});
+
+test('a lock older than ten seconds is stale: it is removed and the write goes ahead', () => {
+  withDir((dir) => {
+    const lock = path.join(dir, `${FILE}.lock`);
+    fs.writeFileSync(lock, '');
+    ageFile(lock, STALE_AGE_MS);
+    const rec = storeIn(dir).add({ type: 'user', text: 'Written after a crash' });
+    assert.equal(storeIn(dir).get(rec.id).text, 'Written after a crash');
+    assert.equal(fs.existsSync(lock), false);
+  });
+});
+
+test('a rename refused with EPERM, EBUSY or EACCES is retried, and the write then succeeds', (t) => {
+  withDir((dir) => {
+    const realRename = fs.renameSync;
+    let calls = 0;
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      calls += 1;
+      if (calls <= RETRIED_CODES.length) throw refusal(RETRIED_CODES[calls - 1]);
+      return realRename(from, to);
+    });
+    const rec = storeIn(dir).add({ type: 'user', text: 'Retried write' });
+    assert.equal(calls, RETRIED_CODES.length + 1);
+    assert.equal(storeIn(dir).get(rec.id).text, 'Retried write');
+  });
+});
+
+test('a rename that keeps failing is tried five times, then rethrown, with no temp file or lock left', (t) => {
+  withDir((dir) => {
+    let calls = 0;
+    t.mock.method(fs, 'renameSync', () => {
+      calls += 1;
+      throw refusal('EBUSY');
+    });
+    assert.throws(() => storeIn(dir).add({ type: 'user', text: 'Never lands' }), /refused: EBUSY/);
+    assert.equal(calls, RENAME_ATTEMPTS);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+});
+
+test('a rename error with another code is thrown at once, without a retry', (t) => {
+  withDir((dir) => {
+    let calls = 0;
+    t.mock.method(fs, 'renameSync', () => {
+      calls += 1;
+      throw refusal('EXDEV');
+    });
+    assert.throws(() => storeIn(dir).add({ type: 'user', text: 'Cross device' }), /refused: EXDEV/);
+    assert.equal(calls, 1);
+  });
+});
+
+test('a lock file that Windows still refuses while another process deletes it (EPERM) is waited for, then taken', (t) => {
+  withDir((dir) => {
+    const realOpen = fs.openSync;
+    let calls = 0;
+    t.mock.method(fs, 'openSync', (p, flags, ...rest) => {
+      if (String(p).endsWith('.lock') && flags === 'wx') {
+        calls += 1;
+        if (calls <= 2) throw refusal('EPERM');
+      }
+      return realOpen(p, flags, ...rest);
+    });
+    const rec = storeIn(dir).add({ type: 'user', text: 'Lock was being deleted' });
+    assert.equal(calls, 3);
+    assert.equal(storeIn(dir).get(rec.id).text, 'Lock was being deleted');
+    assert.equal(fs.existsSync(`${path.join(dir, FILE)}.lock`), false);
+  });
+});
+
+test('a lock that cannot be created for another reason is an error at once, and nothing is written', (t) => {
+  withDir((dir) => {
+    t.mock.method(fs, 'openSync', () => {
+      throw refusal('EROFS');
+    });
+    assert.throws(() => storeIn(dir).add({ type: 'user', text: 'Read only' }), /cannot create lock .*refused: EROFS/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+});
+
+test('a read refused with EBUSY is retried, so a store another process is replacing is still read', (t) => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const rec = storeIn(dir).add({ type: 'user', text: 'Read during a rename' });
+    const realRead = fs.readFileSync;
+    let calls = 0;
+    t.mock.method(fs, 'readFileSync', (p, ...rest) => {
+      if (String(p) === file) {
+        calls += 1;
+        if (calls === 1) throw refusal('EBUSY');
+      }
+      return realRead(p, ...rest);
+    });
+    assert.deepEqual(storeIn(dir).list().map((r) => r.id), [rec.id]);
+    assert.equal(calls, 2);
+  });
+});
+
+test('lines skipped on load are appended to memory.jsonl.rejected on the next write, with line, reason and raw text', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const bad = '{"id": broken';
+    const badType = JSON.stringify({ id: 'm_cccccccccc', type: 'secret', text: 'x', source: 'user', created: 'c', updated: 'u' });
+    const duplicate = line('m_aaaaaaaaaa', 'Again');
+    fs.writeFileSync(file, [line('m_aaaaaaaaaa', 'One'), bad, line('m_bbbbbbbbbb', 'Two'), badType, duplicate, ''].join('\n'));
+    const store = createMemoryStore(file, { now: () => FIXED });
+    store.add({ type: 'user', text: 'Three' });
+    const entries = readJsonl(`${file}.rejected`);
+    assert.deepEqual(entries.map((e) => [e.line, e.error, e.raw]), [
+      [2, 'not JSON', bad],
+      [4, 'bad type', badType],
+      [5, 'duplicate id m_aaaaaaaaaa', duplicate],
+    ]);
+    assert.ok(entries.every((e) => e.at === FIXED.toISOString()));
+  });
+});
+
+test('a rejected line that holds a secret is recorded without its text', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const leaked = '{"id":"m_aaaaaaaaaa","type":"user","text":"key sk-abcdefghijklmnopqrstuvwx"';
+    const leakedRecord = line('m_bbbbbbbbbb', 'key sk-zyxwvutsrqponmlkjihgfedcba');
+    fs.writeFileSync(file, [leaked, leakedRecord, line('m_cccccccccc', 'Plain')].join('\n'));
+    const store = createMemoryStore(file, { now: () => FIXED });
+    store.add({ type: 'user', text: 'Next' });
+    const rejected = fs.readFileSync(`${file}.rejected`, 'utf8');
+    assert.ok(!rejected.includes('sk-abc') && !rejected.includes('sk-zyx'), 'no secret text is written to the rejected file');
+    const entries = readJsonl(`${file}.rejected`);
+    assert.deepEqual(entries.map((e) => [e.line, e.error, e.raw]), [
+      [1, 'not JSON', null],
+      [2, 'text looks like a secret; skipped', null],
+    ]);
+  });
+});
+
+test('reading, and a remove that finds nothing, leave the skipped lines in place; the next real write moves them', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const bad = '{"id": broken';
+    const original = `${line('m_aaaaaaaaaa', 'One')}\n${bad}\n`;
+    fs.writeFileSync(file, original);
+    const store = createMemoryStore(file, { now: () => FIXED });
+    assert.equal(store.warnings.length, 1);
+    assert.equal(store.remove('m_0000000000'), false);
+    assert.equal(fs.existsSync(`${file}.rejected`), false);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    store.add({ type: 'user', text: 'Two' });
+    assert.deepEqual(readJsonl(`${file}.rejected`).map((e) => e.raw), [bad]);
+    assert.deepEqual(store.list().map((r) => r.text), ['One', 'Two']);
   });
 });
