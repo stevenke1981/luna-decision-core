@@ -140,7 +140,11 @@ export function lexicalPicks(shortlist) {
 
 /** Settled with the forced skills when nothing is shortlisted; otherwise one predicate per skill. */
 function plan(input, cfg) {
-  const { forced, shortlist, maxSkills } = candidates(input, cfg);
+  const { forced, shortlist: lexical, maxSkills } = candidates(input, cfg);
+  const semanticFallback = cfg.skills.semanticFallback && lexical.length === 0 && forced.length === 0 && input.catalog.length > 0;
+  const shortlist = semanticFallback
+    ? input.catalog.slice(0, cfg.skills.shortlist).map((skill) => ({ skill, score: 0 }))
+    : lexical;
   if (shortlist.length === 0) {
     const note = input.catalog.length === 0 ? 'catalog is empty' : 'no skill shares a term with the task';
     const selected = select(forced, [], maxSkills);
@@ -159,7 +163,9 @@ function plan(input, cfg) {
       name: ids[i],
       instructions: `Should skill ${ids[i]} ("${skill.name}") be loaded for this task?`,
     })),
-    ctx: { forced, shortlist: shortlist.map(({ skill }) => skill), maxSkills },
+    ctx: { forced, shortlist: shortlist.map(({ skill }) => skill), maxSkills,
+      ...(semanticFallback ? { semanticCatalogSize: input.catalog.length } : {}),
+    },
   };
 }
 
@@ -171,7 +177,11 @@ function interpret(answers, ctx, cfg) {
     .filter(({ probability }) => probability >= cfg.skills.threshold)
     .sort((a, b) => b.probability - a.probability);
   const selected = select(ctx.forced, picks, ctx.maxSkills);
-  return verdict(resultOf(selected, ctx.shortlist.length), mean(probabilities.map(certainty)), reasonsOf(selected));
+  const reasons = reasonsOf(selected);
+  if (ctx.semanticCatalogSize !== undefined) {
+    reasons.unshift(`semantic fallback: no lexical overlap; considered first ${ctx.shortlist.length} of ${ctx.semanticCatalogSize} catalog skills`);
+  }
+  return verdict(resultOf(selected, ctx.shortlist.length), mean(probabilities.map(certainty)), reasons);
 }
 
 /** The rules' verdict, without Luna: forced skills, then the lexical leaders. */

@@ -125,8 +125,7 @@ test('memory_recall throws on a refused answer, so the engine can fall back', as
   await withWorld({}, async ({ cfg, store, deps }) => {
     store.add({ type: 'project', text: 'pnpm install rules' });
     const plan = memoryRecall.plan(await prepared(memoryRecall, { query: 'pnpm install' }, cfg, deps), cfg);
-    const answers = await askFake(memoryRecall, plan, cfg, fakeLuna({ refuse: ['m0'] }));
-    assert.throws(() => memoryRecall.interpret(answers, plan.ctx, cfg), /refused "m0"/);
+    await assert.rejects(askFake(memoryRecall, plan, cfg, fakeLuna({ refuse: ['m0'] })), /refused "m0"/);
   });
 });
 
@@ -293,8 +292,7 @@ test('memory_write rejects an update answer when no similar memory was asked', a
 test('memory_write throws on a refused durable answer', async () => {
   await withWorld({}, async ({ cfg, deps }) => {
     const plan = memoryWrite.plan(await prepared(memoryWrite, { observation: 'Ship the v2 release on Friday' }, cfg, deps), cfg);
-    const answers = await askFake(memoryWrite, plan, cfg, fakeLuna({ refuse: ['durable'], choices: { action: 'save_new' } }));
-    assert.throws(() => memoryWrite.interpret(answers, plan.ctx, cfg), /refused "durable"/);
+    await assert.rejects(askFake(memoryWrite, plan, cfg, fakeLuna({ refuse: ['durable'], choices: { action: 'save_new' } })), /refused "durable"/);
   });
 });
 

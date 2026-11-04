@@ -1,6 +1,7 @@
 // The command-line interface (docs/design.md §6). `main(argv, io)` parses one command strictly
 // (node:util parseArgs), runs it and resolves to the exit code: 0 ok, 1 error, 2 usage. Decisions
-// are JSON on stdout; messages go to stderr with every secret scrubbed. Nothing is read from the
+// are JSON on stdout by default; doctor is a readable offline report. Errors go to stderr with
+// every secret scrubbed. Nothing is read from the
 // environment except through `io.env`, so tests pass their own. `bin/luna-core.js` loads the env
 // files and calls this.
 import fs from 'node:fs';
@@ -13,9 +14,12 @@ import { KIND_MODULES } from './registry.js';
 import { VERSION } from './version.js';
 import { scrubSecrets, startHttp } from './server/http.js';
 import { createMcpServer } from './server/mcp.js';
+import { diagnose, formatDiagnostics } from './diagnostics.js';
 
 /** Exit codes: 0 success, 1 a failed command (Luna, IO, config), 2 a usage or input error. */
 export const EXIT = Object.freeze({ OK: 0, ERROR: 1, USAGE: 2 });
+/** JSON input files and stdin are bounded to the same 1 MiB as HTTP request bodies. */
+export const INPUT_LIMIT_BYTES = 1024 * 1024;
 const PROBE_MODE = 'luna';
 const PROBE_TASK = 'Probe: rename one local variable inside a small helper function.';
 const MAX_PORT = 65535;
@@ -26,6 +30,7 @@ const HELP_HINT = 'Run "luna-core --help" for the commands and options.';
 const USAGE = `Usage: luna-core <command> [options]
 
 Commands:
+  doctor [--json]              offline configuration checks; no network calls or file writes
   probe                        one live Luna call (route, strict mode); needs an API key
   route --task T               model and effort   [--context-tokens N] [--requires a,b] [--local-only]
   skills --task T              skills to load     [--dir D ...] (repeat --dir for more folders)
@@ -37,13 +42,20 @@ Commands:
   mcp                          MCP server on stdin and stdout
   config                       effective configuration; the API key shows as set or unset
 
+Decision command options (route, skills, retrieve, recall, remember, compress):
+  --input FILE|-               full input object as JSON (file or stdin; up to 1 MiB)
+                              use instead of the command's individual input options
+  --format json|text           JSON by default; text adds a readable summary and reasons
+                              also available for probe
+
 Options for every command:
   --mode auto|luna|heuristic   auto: Luna, then the rules; luna: strict; heuristic: rules only
   --config FILE                JSON config file
   -h, --help                   this text
   --version                    the version
 
-Output is JSON on stdout and errors go to stderr. Exit codes: 0 ok, 1 error, 2 usage.
+Decisions are JSON on stdout by default; doctor is text unless --json is given.
+Errors go to stderr. Exit codes: 0 ok, 1 error, 2 usage.
 Keys: LUNA_API_KEY or OPENAI_API_KEY, from the environment or an env file.
 `;
 
@@ -59,15 +71,25 @@ const str = { type: 'string' };
 const multi = { type: 'string', multiple: true };
 const flag = { type: 'boolean' };
 const COMMON_OPTIONS = { mode: str, config: str, help: { type: 'boolean', short: 'h' }, version: flag };
+const DECISION_OPTIONS = { input: str, format: str };
+const INPUT_FIELDS = Object.freeze({
+  route: ['task', 'steps', 'contextTokens', 'requires', 'localOnly', 'candidates'],
+  skills: ['task', 'catalog', 'dirs', 'maxSkills'],
+  retrieve: ['query', 'root', 'candidates', 'budgetTokens', 'force'],
+  memory_recall: ['query', 'limit'],
+  memory_write: ['observation', 'source', 'type', 'dryRun'],
+  compress: ['window', 'segments', 'goal', 'force'],
+});
 
 const COMMANDS = Object.freeze({
-  probe: { options: {}, run: runProbe },
-  route: { options: { task: str, 'context-tokens': str, requires: str, 'local-only': flag }, run: runRoute },
-  skills: { options: { task: str, dir: multi }, run: runSkills },
-  retrieve: { options: { query: str, root: str, budget: str, force: flag }, run: runRetrieve },
-  recall: { options: { query: str }, run: runRecall },
-  remember: { options: { text: str, source: str, 'dry-run': flag }, run: runRemember },
-  compress: { options: { file: str }, run: runCompress },
+  doctor: { options: { json: flag }, run: runDoctor },
+  probe: { options: { format: str }, run: runProbe },
+  route: { options: { ...DECISION_OPTIONS, task: str, 'context-tokens': str, requires: str, 'local-only': flag }, run: runRoute },
+  skills: { options: { ...DECISION_OPTIONS, task: str, dir: multi }, run: runSkills },
+  retrieve: { options: { ...DECISION_OPTIONS, query: str, root: str, budget: str, force: flag }, run: runRetrieve },
+  recall: { options: { ...DECISION_OPTIONS, query: str }, run: runRecall },
+  remember: { options: { ...DECISION_OPTIONS, text: str, source: str, 'dry-run': flag }, run: runRemember },
+  compress: { options: { ...DECISION_OPTIONS, file: str }, run: runCompress },
   serve: { options: { port: str }, run: runServe },
   mcp: { options: {}, run: runMcp },
   config: { options: {}, run: runConfig },
@@ -93,6 +115,12 @@ function parseOptions(args, spec) {
     throw new UsageError(err.message);
   }
   if (values.mode !== undefined && !MODES.includes(values.mode)) throw new UsageError(`--mode must be ${MODES.join(', ')}`);
+  if (values.format !== undefined && !['json', 'text'].includes(values.format)) throw new UsageError('--format must be json or text');
+  if (values.input !== undefined) {
+    if (!values.input.trim()) throw new UsageError('--input needs a file path or "-" for stdin');
+    const conflict = Object.keys(values).find((key) => !Object.hasOwn(COMMON_OPTIONS, key) && !Object.hasOwn(DECISION_OPTIONS, key));
+    if (conflict) throw new UsageError(`--input cannot be combined with --${conflict}; put all input fields in the JSON object`);
+  }
   return values;
 }
 
@@ -185,10 +213,28 @@ function checkInput(kind, input, config) {
   }
 }
 
-async function decideAndPrint(io, config, kind, input) {
+function printDecision(io, decision, format) {
+  if (format !== 'text') return writeJson(io.stdout, decision);
+  const lines = [
+    KIND_MODULES[decision.kind].summarize(decision.result),
+    `Source: ${decision.source}`,
+    `Luna responses received: ${decision.calls}; duration: ${decision.latencyMs} ms`,
+  ];
+  if (decision.confidence != null) lines.push(`Confidence: ${decision.confidence}`);
+  for (const reason of decision.reasons) lines.push(`Reason: ${reason}`);
+  if (decision.error) lines.push(`Fallback reason: ${decision.error}`);
+  if (decision.kind === 'route') lines.push('The host must apply this model and effort recommendation.');
+  if (decision.cost != null) lines.push(`Estimated decision cost (USD): ${decision.cost}`);
+  if (decision.tokens != null) lines.push(`Input tokens: ${decision.tokens.input}; cached: ${decision.tokens.cached}`);
+  // The result stays complete in text mode, as it does in JSON mode. Scrub diagnostic lines.
+  const secrets = KEY_VARIABLES.map((key) => io.env[key]);
+  io.stdout.write(`${lines.map((line) => scrubSecrets(line, secrets)).join('\n')}\n\nResult:\n${JSON.stringify(decision.result, null, 2)}\n`);
+}
+
+async function decideAndPrint(io, config, kind, input, format) {
   checkInput(kind, input, config);
   const engine = createEngine({ config, transport: io.transport });
-  writeJson(io.stdout, await engine.decide(kind, input));
+  printDecision(io, await engine.decide(kind, input), format);
   return EXIT.OK;
 }
 
@@ -201,64 +247,141 @@ async function runProbe({ values, io }) {
     throw new Error('probe: no OpenAI API key; set LUNA_API_KEY or OPENAI_API_KEY in the environment or an env file');
   }
   const engine = createEngine({ config, transport: io.transport });
-  writeJson(io.stdout, await engine.route({ task: PROBE_TASK }));
+  printDecision(io, await engine.route({ task: PROBE_TASK }), values.format);
   return EXIT.OK;
 }
 
 async function runRoute({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('route', values, io);
   const input = { task: requireOption(values, 'task') };
   const contextTokens = intOption(values, 'context-tokens', { min: 0 });
   if (contextTokens !== undefined) input.contextTokens = contextTokens;
   if (values.requires !== undefined) input.requires = values.requires.split(',').map((s) => s.trim()).filter(Boolean);
   if (values['local-only']) input.localOnly = true;
-  return decideAndPrint(io, configFor(io, values), 'route', input);
+  return decideAndPrint(io, configFor(io, values), 'route', input, values.format);
 }
 
 async function runSkills({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('skills', values, io);
   const input = { task: requireOption(values, 'task') };
   if (values.dir !== undefined) input.dirs = values.dir.map((dir) => resolveIn(io.cwd, dir));
-  return decideAndPrint(io, configFor(io, values), 'skills', input);
+  return decideAndPrint(io, configFor(io, values), 'skills', input, values.format);
 }
 
 async function runRetrieve({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('retrieve', values, io);
   const input = { query: requireOption(values, 'query') };
   if (values.root !== undefined) input.root = resolveIn(io.cwd, values.root);
   const budgetTokens = intOption(values, 'budget', { min: 1 });
   if (budgetTokens !== undefined) input.budgetTokens = budgetTokens;
   if (values.force) input.force = true;
-  return decideAndPrint(io, configFor(io, values), 'retrieve', input);
+  return decideAndPrint(io, configFor(io, values), 'retrieve', input, values.format);
 }
 
 async function runRecall({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('memory_recall', values, io);
   const input = { query: requireOption(values, 'query') };
-  return decideAndPrint(io, configFor(io, values), 'memory_recall', input);
+  return decideAndPrint(io, configFor(io, values), 'memory_recall', input, values.format);
 }
 
 async function runRemember({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('memory_write', values, io);
   const input = { observation: requireOption(values, 'text') };
   if (values.source !== undefined) input.source = values.source;
   if (values['dry-run']) input.dryRun = true;
-  return decideAndPrint(io, configFor(io, values), 'memory_write', input);
+  return decideAndPrint(io, configFor(io, values), 'memory_write', input, values.format);
 }
 
-/** The JSON object in a file. A file that cannot be read is an error; one that is not JSON is usage. */
-function readInputFile(file) {
-  let text;
+function parseInput(text, label) {
+  let input;
   try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    throw new Error(`cannot read ${file}: ${err.code ?? err.message}`);
-  }
-  try {
-    return JSON.parse(text);
+    input = JSON.parse(text.replace(/^\uFEFF/, ''));
   } catch {
-    throw new UsageError(`${file} is not valid JSON`);
+    throw new UsageError(`${label} is not valid JSON`);
   }
+  return input;
+}
+
+function tooLarge(label) {
+  return new UsageError(`${label} is over ${INPUT_LIMIT_BYTES} bytes (1 MiB)`);
+}
+
+/** Read only a bounded number of bytes, including when a file grows while it is read. */
+function readInputFile(file) {
+  let fd;
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) throw new Error('not a regular file');
+    if (stat.size > INPUT_LIMIT_BYTES) throw tooLarge(file);
+    fd = fs.openSync(file, 'r');
+    if (!fs.fstatSync(fd).isFile()) throw new Error('not a regular file');
+    const buffer = Buffer.alloc(INPUT_LIMIT_BYTES + 1);
+    let size = 0;
+    let read;
+    do {
+      read = fs.readSync(fd, buffer, size, buffer.length - size, null);
+      size += read;
+      if (size > INPUT_LIMIT_BYTES) throw tooLarge(file);
+    } while (read > 0);
+    return parseInput(buffer.subarray(0, size).toString('utf8'), file);
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
+    throw new Error(`cannot read ${file}: ${err.code ?? err.message}`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+async function readStdin(input) {
+  if (input.isTTY) throw new UsageError('--input - needs piped JSON on stdin; use --input FILE to read a file');
+  const chunks = [];
+  let size = 0;
+  try {
+    for await (const chunk of input) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > INPUT_LIMIT_BYTES) throw tooLarge('stdin input');
+      chunks.push(bytes);
+    }
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
+    throw new Error(`cannot read stdin: ${err.code ?? err.message}`);
+  }
+  return parseInput(Buffer.concat(chunks, size).toString('utf8'), 'stdin input');
+}
+
+/** JSON paths follow the command's working folder, just like --root and --dir. */
+function inputPaths(kind, input, io) {
+  if (kind === 'retrieve' && typeof input.root === 'string' && input.root.trim()) {
+    return { ...input, root: resolveIn(io.cwd, input.root) };
+  }
+  if (kind === 'skills' && Array.isArray(input.dirs)) {
+    return { ...input, dirs: input.dirs.map((dir) => typeof dir === 'string' && dir.trim() ? resolveIn(io.cwd, dir) : dir) };
+  }
+  return input;
+}
+
+async function runJsonInput(kind, values, io) {
+  const input = values.input === '-' ? await readStdin(io.stdin) : readInputFile(resolveIn(io.cwd, values.input));
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new UsageError(`${kind}: input must be an object (JSON)`);
+  }
+  const extra = Object.keys(input).find((key) => !INPUT_FIELDS[kind].includes(key));
+  if (extra !== undefined) throw new UsageError(`${kind}: unknown input field "${extra}"`);
+  return decideAndPrint(io, configFor(io, values), kind, inputPaths(kind, input, io), values.format);
 }
 
 async function runCompress({ values, io }) {
+  if (values.input !== undefined) return runJsonInput('compress', values, io);
   const input = readInputFile(resolveIn(io.cwd, requireOption(values, 'file')));
-  return decideAndPrint(io, configFor(io, values), 'compress', input);
+  return decideAndPrint(io, configFor(io, values), 'compress', input, values.format);
+}
+
+async function runDoctor({ values, io }) {
+  const report = diagnose(configFor(io, values));
+  if (values.json) writeJson(io.stdout, report);
+  else io.stdout.write(formatDiagnostics(report));
+  return report.ok ? EXIT.OK : EXIT.ERROR;
 }
 
 /** Resolves when the server closes, after `signal` aborts (which closes it). */

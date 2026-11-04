@@ -7,22 +7,25 @@
 import { createHash } from 'node:crypto';
 import { RUBRIC, CACHE_KEY } from '../rubric.js';
 import { redact } from '../contract.js';
+import { validateAnswers } from './answers.js';
 
-// Uncached input; output is free. Cached reads cost less, so this is an upper bound.
+// Base-rate input estimate, not an invoice or upper bound: cache writes, regional processing
+// and long-context pricing can change the charge. The cost field retains its existing units.
 export const USD_PER_INPUT_TOKEN = 0.10 / 1e6;
 const PAUSE_MS = { timeout: 30_000, auth: 600_000, rate: 60_000 };
 const MAX_RETRY_AFTER_MS = 600_000;
+const MAX_QUESTIONS_PER_CALL = 400;
 const QUESTION_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 // What replaces the literal API key when a server echoes it back in an error message.
 export const KEY_MARK = '[key]';
 
 const pausedUntil = new Map();
-let explicitCacheRejected = false;
+const explicitCacheRejected = new Set();
 
 /** Ends every pause and forgets a rejected cache mode; for tests. */
 export function resetLunaState() {
   pausedUntil.clear();
-  explicitCacheRejected = false;
+  explicitCacheRejected.clear();
 }
 
 /**
@@ -39,16 +42,37 @@ export function scrubDetail(text, apiKey) {
 }
 
 function pauseKey(opts) {
-  return `${opts.url} ${createHash('sha256').update(opts.apiKey ?? '').digest('hex').slice(0, 16)}`;
+  return JSON.stringify([opts.url, createHash('sha256').update(opts.apiKey ?? '').digest('hex'), opts.organization ?? '', opts.project ?? '']);
+}
+
+function cacheScope(opts) {
+  return JSON.stringify([pauseKey(opts), opts.model]);
 }
 
 function pause(opts, ms) {
-  pausedUntil.set(pauseKey(opts), Date.now() + ms);
+  const key = pauseKey(opts);
+  pausedUntil.set(key, Math.max(pausedUntil.get(key) ?? 0, Date.now() + ms));
+}
+
+function assertNotPaused(opts) {
+  const until = pausedUntil.get(pauseKey(opts)) ?? 0;
+  if (Date.now() < until) throw new Error(`Luna paused for ${Math.ceil((until - Date.now()) / 1000)} s after a failure`);
 }
 
 function retryAfterMs(res) {
-  const s = Number(res.headers.get('retry-after'));
-  return Number.isFinite(s) && s > 0 ? Math.min(s * 1000, MAX_RETRY_AFTER_MS) : PAUSE_MS.rate;
+  const value = res.headers.get('retry-after')?.trim();
+  if (!value) return PAUSE_MS.rate;
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(value)) {
+    const seconds = Number(value);
+    return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, MAX_RETRY_AFTER_MS) : PAUSE_MS.rate;
+  }
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, Math.min(date - Date.now(), MAX_RETRY_AFTER_MS)) : PAUSE_MS.rate;
+}
+
+function pauseForStatus(opts, res) {
+  if (res.status === 401 || res.status === 403) pause(opts, PAUSE_MS.auth);
+  if (res.status === 429) pause(opts, retryAfterMs(res));
 }
 
 /**
@@ -59,16 +83,19 @@ export function validateQuestions(questions) {
   if (!Array.isArray(questions) || questions.length === 0) throw new Error('no questions to ask Luna');
   const names = new Set();
   for (const q of questions) {
-    if (!QUESTION_NAME.test(q?.name ?? '')) throw new Error(`invalid question name "${q?.name}"`);
+    if (typeof q?.name !== 'string' || !QUESTION_NAME.test(q.name)) throw new Error(`invalid question name "${q?.name}"`);
     if (names.has(q.name)) throw new Error(`duplicate question name "${q.name}"`);
     names.add(q.name);
     if (typeof q.instructions !== 'string' || !q.instructions.trim()) throw new Error(`question "${q.name}" has no instructions`);
     if (q.type === 'choice') {
-      const values = (q.choices ?? []).map((c) => c?.value);
+      if (!Array.isArray(q.choices)) throw new Error(`choice "${q.name}" needs at least 2 distinct choices`);
+      const values = q.choices.map((c) => c?.value);
       if (values.length < 2 || new Set(values).size !== values.length) throw new Error(`choice "${q.name}" needs at least 2 distinct choices`);
+      if (values.some((value) => typeof value !== 'string' && typeof value !== 'boolean')) throw new Error(`choice "${q.name}" values must be strings or booleans`);
     } else if (q.type === 'score') {
-      const n = q.levels?.length ?? 0;
+      const n = Array.isArray(q.levels) ? q.levels.length : 0;
       if (n < 2 || n > 10) throw new Error(`score "${q.name}" needs 2 to 10 levels`);
+      if (q.levels.some((level) => typeof level?.label !== 'string')) throw new Error(`score "${q.name}" levels must have string labels`);
     } else if (q.type !== 'predicate') {
       throw new Error(`question "${q.name}" has unknown type "${q.type}"`);
     }
@@ -87,11 +114,12 @@ export function requestBody(model, state, questions, cacheMode = 'explicit') {
     ],
     questions,
     ...(cacheMode !== 'off' ? { prompt_cache_key: CACHE_KEY } : {}),
-    ...(cacheMode === 'explicit' ? { prompt_cache_options: { mode: 'explicit' } } : {}),
+    // The API defaults to implicit caching. Explicit mode without any breakpoint disables it.
+    ...(cacheMode === 'explicit' || cacheMode === 'off' ? { prompt_cache_options: { mode: 'explicit' } } : {}),
   };
 }
 
-/** Tokens and the uncached-price upper bound of one response. */
+/** Tokens and the base-rate input cost estimate of one response. */
 export function callCost(usage) {
   const input = Number.isFinite(usage?.input_tokens) ? usage.input_tokens : null;
   if (input == null) return { cost: null, tokens: null };
@@ -109,12 +137,33 @@ function headersFor(opts) {
 }
 
 async function send(opts, body) {
+  // Also guard negotiation retries: another in-flight request may have started a pause.
+  assertNotPaused(opts);
+  const signal = AbortSignal.timeout(opts.timeoutMs);
+  let readingBody = false;
   try {
-    return await fetch(opts.url, {
-      method: 'POST', headers: headersFor(opts), body: JSON.stringify(body), signal: AbortSignal.timeout(opts.timeoutMs),
+    const res = await fetch(opts.url, {
+      method: 'POST', headers: headersFor(opts), body: JSON.stringify(body), signal,
     });
+    // Apply HTTP cooldowns even if its error body is malformed, truncated, or never finishes.
+    pauseForStatus(opts, res);
+    readingBody = true;
+    let parsed;
+    try {
+      parsed = await res.json();
+    } catch (err) {
+      if (signal.aborted || err?.name !== 'SyntaxError') throw err;
+      if (res.ok) throw new Error(`Luna returned invalid JSON (HTTP ${res.status})`);
+      parsed = null;
+    }
+    return { res, body: parsed };
   } catch (err) {
-    if (err?.name === 'TimeoutError') pause(opts, PAUSE_MS.timeout);
+    if (signal.reason?.name === 'TimeoutError' || err?.name === 'TimeoutError') {
+      pause(opts, PAUSE_MS.timeout);
+      const timeout = new Error(`Luna timed out after ${opts.timeoutMs} ms ${readingBody ? 'while reading the response body' : 'waiting for a response'}`, { cause: err });
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
     throw err;
   }
 }
@@ -124,25 +173,24 @@ async function send(opts, body) {
  * @param {LunaOptions} opts
  */
 export async function postDecision(opts, state, questions) {
+  validateQuestions(questions);
+  if (questions.length > MAX_QUESTIONS_PER_CALL) throw new Error(`Luna accepts at most ${MAX_QUESTIONS_PER_CALL} questions per call`);
   if (!opts.apiKey) throw new Error('no OpenAI API key (set LUNA_API_KEY or OPENAI_API_KEY)');
-  const until = pausedUntil.get(pauseKey(opts)) ?? 0;
-  if (Date.now() < until) throw new Error(`Luna paused for ${Math.ceil((until - Date.now()) / 1000)} s after a failure`);
   let mode = opts.cacheMode ?? 'explicit';
-  if (mode === 'explicit' && explicitCacheRejected) mode = 'implicit';
-  let res = await send(opts, requestBody(opts.model, state, questions, mode));
-  let body = await res.json().catch(() => null);
+  const scope = cacheScope(opts);
+  if (mode === 'explicit' && explicitCacheRejected.has(scope)) mode = 'implicit';
+  let { res, body } = await send(opts, requestBody(opts.model, state, questions, mode));
   if (res.status === 400 && mode === 'explicit' && /cache/i.test(body?.error?.message ?? '')) {
-    explicitCacheRejected = true;
-    res = await send(opts, requestBody(opts.model, state, questions, 'implicit'));
-    body = await res.json().catch(() => null);
+    explicitCacheRejected.add(scope);
+    ({ res, body } = await send(opts, requestBody(opts.model, state, questions, 'implicit')));
   }
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) pause(opts, PAUSE_MS.auth);
-    if (res.status === 429) pause(opts, retryAfterMs(res));
     const detail = scrubDetail(body?.error?.message ?? 'no error body', opts.apiKey);
     throw new Error(`Luna HTTP ${res.status}: ${detail}`);
   }
-  pausedUntil.delete(pauseKey(opts));
+  const key = pauseKey(opts);
+  // A concurrent request may have failed after this one started. Its active pause still applies.
+  if ((pausedUntil.get(key) ?? 0) <= Date.now()) pausedUntil.delete(key);
   return body;
 }
 
@@ -158,15 +206,18 @@ export async function postDecision(opts, state, questions) {
  */
 export async function askLuna(opts, state, questions, transport = postDecision) {
   validateQuestions(questions);
-  const size = Math.max(1, opts.maxQuestionsPerCall ?? 16);
+  const size = opts.maxQuestionsPerCall ?? 16;
+  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_QUESTIONS_PER_CALL) throw new Error(`maxQuestionsPerCall must be an integer from 1 to ${MAX_QUESTIONS_PER_CALL}`);
   const answers = [];
   let cost = null;
   let tokens = null;
   let calls = 0;
   for (let i = 0; i < questions.length; i += size) {
-    const body = await transport(opts, state, questions.slice(i, i + size));
+    const batch = questions.slice(i, i + size);
+    const body = await transport(opts, state, batch);
     calls++;
-    if (Array.isArray(body?.answers)) answers.push(...body.answers);
+    validateAnswers(body, batch);
+    answers.push(...body.answers);
     const c = callCost(body?.usage);
     if (c.cost != null) {
       cost = (cost ?? 0) + c.cost;

@@ -64,6 +64,11 @@ Decision = {
 }
 ```
 
+`calls` counts resolved transport calls, including a body subsequently rejected by answer
+validation. It does not count thrown HTTP failures or cache-negotiation retries; zero is not
+proof that no request was sent. `cost` is a base-input-rate estimate, not a guaranteed upper
+bound or invoice amount; cache-write, regional, and long-context adjustments are not modeled.
+
 ## 3. Kind module contract
 
 See `src/contract.js` (normative). Every kind module exports one frozen object with `name`,
@@ -134,7 +139,11 @@ name; duplicates by name keep the first dir's.
 Plan: forced = skills referenced in the task as a `/name` command (at the start or after
 whitespace/an opening quote), or by a distinctive name (containing `-` or `:`) as a whole word;
 case-insensitive, name ≥ 4 chars. A plain word such as `testing` written in prose is left to Luna. Shortlist = `createBm25(name + description)` top `cfg.skills.shortlist`,
-excluding forced. Empty shortlist → settled. State `{ task: excerpt 2000, skills: [{id: s<i>,
+excluding forced. Empty shortlist → settled by default. If `skills.semanticFallback` is true,
+the catalog is nonempty, and neither lexical nor forced candidates exist, consider the first
+`cfg.skills.shortlist` catalog entries instead. The decision reasons state how much of the
+catalog was considered. Heuristic mode never manufactures semantic matches.
+State `{ task: excerpt 2000, skills: [{id: s<i>,
 name, description: excerpt 300}] }`; predicate `s<i>`: `Should skill s<i> ("name") be loaded for
 this task?`.
 
@@ -279,6 +288,14 @@ tokens), `route --task T [--context-tokens N] [--requires a,b] [--local-only]`, 
 `remember --text T [--source user] [--dry-run]`, `compress --file transcript.json` (input object
 JSON), `serve [--port N]`, `mcp`, `config` (effective config without the key), `--mode`,
 `--config`, `--version`, `--help`. Loads env files first.
+
+All six decision commands also accept `--input FILE|-` (a complete JSON input object, up to
+1 MiB, UTF-8 BOM accepted). It cannot be combined with per-command input flags, but supports
+`--mode`, `--config` and `--format json|text`. JSON remains the default decision output.
+Relative JSON paths resolve from the command's working folder. `doctor [--json]` reports local
+configuration readiness without network requests or file writes, and does not validate live
+credentials or model access.
+The legacy `compress --file` path also uses the 1 MiB file limit and accepts UTF-8 BOM.
 
 HTTP: `GET /health` → `{ok, version, mode}`; `POST /v1/decide/:kind` JSON body → Decision; `GET
 /v1/stats`. Binds 127.0.0.1 by default; rejects any `Origin` header with 403 before dispatch.
