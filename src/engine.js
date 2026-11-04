@@ -36,9 +36,21 @@ function once(load) {
 
 const loadRegistry = once(async () => (await import('./registry.js')).KIND_MODULES);
 
-function memo(cache, key, make) {
-  if (!cache.has(key)) cache.set(key, make());
-  return cache.get(key);
+/**
+ * A cache of built values by key. An entry older than `ttlMs` is built again, so a long-running
+ * serve or mcp sees edited files; `ttlMs` 0 keeps nothing and every call builds afresh.
+ * @returns {(key: string, make: () => *) => *}
+ */
+function ttlCache(ttlMs, now) {
+  const entries = new Map();
+  return (key, make) => {
+    const hit = entries.get(key);
+    if (ttlMs > 0 && hit && now() - hit.at <= ttlMs) return hit.value;
+    const at = now();
+    const value = make();
+    if (ttlMs > 0) entries.set(key, { value, at });
+    return value;
+  };
 }
 
 function toError(err) {
@@ -51,28 +63,30 @@ function elapsedSince(t0) {
 
 /**
  * The default deps, built from factories (the real ones, or stubs in tests). Injected entries win.
- * The store is created on first use; the catalog is cached by its dirs, the index by resolved root.
+ * The store is created on first use; the catalog is cached by its dirs, the index by resolved root,
+ * and each cached entry is rebuilt once older than config.cacheTtlMs (0: never cached).
  * @param {object} config
  * @param {{createMemoryStore: Function, loadCatalog: Function, createRepoIndex: Function}} factories
  * @param {{store?: object, loadCatalog?: Function, repoIndex?: Function}} injected
+ * @param {() => number} [now] clock in milliseconds (default Date.now), injected by tests
  */
-export function buildDeps(config, factories, injected = {}) {
-  const catalogs = new Map();
-  const indexes = new Map();
+export function buildDeps(config, factories, injected = {}, now = Date.now) {
+  const catalogs = ttlCache(config.cacheTtlMs, now);
+  const indexes = ttlCache(config.cacheTtlMs, now);
   let store = null;
   return Object.freeze({
     get store() {
       return injected.store ?? (store ??= factories.createMemoryStore(config.memory.path));
     },
     loadCatalog: injected.loadCatalog
-      ?? ((dirs) => memo(catalogs, dirs.join('|'), () => factories.loadCatalog(dirs))),
+      ?? ((dirs) => catalogs(dirs.join('|'), () => factories.loadCatalog(dirs))),
     repoIndex: injected.repoIndex
-      ?? ((root) => memo(indexes, path.resolve(root), () => factories.createRepoIndex(root, config.retrieve))),
+      ?? ((root) => indexes(path.resolve(root), () => factories.createRepoIndex(root, config.retrieve))),
   });
 }
 
 /** The deps for prepare and finalize: the injected object as given when complete, else defaults. */
-async function resolveDeps(config, injected) {
+async function resolveDeps(config, injected, now) {
   if (DEP_KEYS.every((k) => injected[k] !== undefined)) return injected;
   const [store, catalog, index] = await Promise.all([
     import('./memory/store.js'), import('./skills/catalog.js'), import('./index/repo.js'),
@@ -81,7 +95,7 @@ async function resolveDeps(config, injected) {
     createMemoryStore: store.createMemoryStore,
     loadCatalog: catalog.loadCatalog,
     createRepoIndex: index.createRepoIndex,
-  }, injected);
+  }, injected, now);
 }
 
 /** Counts the Luna calls that answered and what they cost, whether or not the decision succeeds. */
@@ -210,18 +224,21 @@ function countDecision(s, kind, decision) {
 /**
  * The engine: `decide(kind, input)` and one shortcut per kind. Every returned decision is logged.
  * @param {{config: object, transport?: Function, kinds?: Record<string, object>,
- *   deps?: {store?: object, loadCatalog?: Function, repoIndex?: Function}, ledger?: {append: Function}}} options
+ *   deps?: {store?: object, loadCatalog?: Function, repoIndex?: Function}, ledger?: {append: Function},
+ *   now?: () => number}} options
  *   `config` from loadConfig; `kinds` defaults to the registry; `deps` defaults to the real store,
- *   catalog and index, loaded on first use; `ledger` defaults to the config's ledger.
+ *   catalog and index, loaded on first use; `ledger` defaults to the config's ledger; `now` is the
+ *   clock in milliseconds for the cache TTL (default Date.now), injected by tests.
  * @returns {Readonly<{decide: Function, route: Function, skills: Function, retrieve: Function,
  *   recall: Function, remember: Function, compress: Function, stats: () => object}>}
  */
-export function createEngine({ config, transport = postDecision, kinds, deps, ledger } = {}) {
+export function createEngine({ config, transport = postDecision, kinds, deps, ledger, now = Date.now } = {}) {
   if (!config) throw new TypeError('createEngine: config is required');
+  if (typeof now !== 'function') throw new TypeError('createEngine: now must be a function');
   const ctx = Object.freeze({ config, opts: lunaOptions(config), send: transport });
   const log = ledger ?? createLedger({ path: config.ledger.path, enabled: config.ledger.enabled });
   const getKinds = kinds ? async () => kinds : loadRegistry;
-  const getDeps = once(() => resolveDeps(config, deps ?? {}));
+  const getDeps = once(() => resolveDeps(config, deps ?? {}, now));
   let stats = initialStats();
 
   async function moduleFor(kind) {

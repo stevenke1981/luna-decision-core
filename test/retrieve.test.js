@@ -61,7 +61,8 @@ test('normalize rejects bad input and returns a new object with the defaults app
 }));
 
 test('prepare fills candidates from the repository index only when they are absent and a root is given', () => withDir(async (dir) => {
-  const cfg = cfgFor(dir);
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const repo = path.join(dir, 'repo');
   const calls = [];
   const deps = {
     repoIndex: (root) => {
@@ -69,16 +70,93 @@ test('prepare fills candidates from the repository index only when they are abse
       return { search: (query, k) => { calls.push([query, k]); return [cand('src/x.js#1', 'text', { score: 2 })]; } };
     },
   };
-  const found = await prepare(normalize({ query: 'cache eviction', root: '/repo' }, cfg), cfg, deps);
+  const found = await prepare(normalize({ query: 'cache eviction', root: repo }, cfg), cfg, deps);
   assert.deepEqual(found.candidates.map((c) => c.id), ['src/x.js#1']);
-  assert.deepEqual(calls, ['/repo', ['cache eviction', cfg.retrieve.shortlist]]);
+  assert.deepEqual(calls, [repo, ['cache eviction', cfg.retrieve.shortlist]]);
   calls.length = 0;
-  await prepare(normalize({ query: 'q', root: '/repo', candidates: [] }, cfg), cfg, deps);
+  await prepare(normalize({ query: 'q', root: repo, candidates: [] }, cfg), cfg, deps);
   assert.equal(calls.length, 0, 'given candidates, even empty, are not replaced');
   const noRoot = await prepare(normalize({ query: 'q' }, cfg), cfg, deps);
   assert.deepEqual(noRoot.candidates, []);
   assert.equal(calls.length, 0, 'no root, no search');
-  await assert.rejects(prepare(normalize({ query: 'q', root: '/r' }, cfg), cfg, {}), /no repoIndex dependency/);
+  await assert.rejects(prepare(normalize({ query: 'q', root: repo }, cfg), cfg, {}), /no repoIndex dependency/);
+}));
+
+test('normalize resolves root to an absolute path, and a root inside an allowed root is kept', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const repo = path.join(dir, 'repo');
+  assert.equal(normalize({ query: 'where is it', root: repo }, cfg).root, repo);
+  const relative = path.relative(process.cwd(), repo);
+  assert.equal(normalize({ query: 'where is it', root: relative }, cfg).root, repo, 'a relative root resolves against the working folder');
+  assert.equal(normalize({ query: 'where is it', root: dir }, cfg).root, dir, 'the allowed root itself is allowed');
+  assert.equal(normalize({ query: 'where is it' }, cfg).root, undefined, 'no root, none resolved');
+}));
+
+test('normalize rejects a root outside retrieve.allowedRoots, including "..", a sibling with the same prefix, and a drive root', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const outside = [
+    path.dirname(dir),
+    path.join(dir, '..', 'escape'),
+    path.join(dir, 'a', '..', '..', 'escape'),
+    `${dir}-sibling`,
+    path.parse(dir).root,
+  ];
+  for (const root of outside) throwsType(() => normalize({ query: 'where is it', root }, cfg), /outside retrieve\.allowedRoots/);
+}));
+
+test('with no allowedRoots a root must lie in the working folder the config was loaded for', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir);
+  const cwd = cfg.cwd;
+  assert.equal(cwd, path.resolve(dir));
+  assert.equal(normalize({ query: 'where is it', root: path.join(cwd, 'src') }, cfg).root, path.join(cwd, 'src'));
+  assert.equal(normalize({ query: 'where is it', root: cwd }, cfg).root, cwd);
+  throwsType(() => normalize({ query: 'where is it', root: path.join(cwd, '..', 'elsewhere') }, cfg), /is outside the working folder/);
+  throwsType(() => normalize({ query: 'where is it', root: process.cwd() === dir ? os.tmpdir() : process.cwd() }, cfg), /is outside the working folder/);
+}));
+
+test('a root that is a link to a folder outside the allowed ones is refused before indexing', () => withDir(async (dir) => {
+  const inside = path.join(dir, 'inside');
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-out-'));
+  try {
+    fs.mkdirSync(inside);
+    fs.writeFileSync(path.join(outside, 'secret.js'), 'export const hidden = 1;\n');
+    const link = path.join(inside, 'link');
+    fs.symlinkSync(outside, link, 'junction');
+    const cfg = cfgFor(dir, { allowedRoots: [inside] });
+    const input = normalize({ query: 'hidden export', root: link }, cfg);
+    let indexed = 0;
+    const deps = { repoIndex: () => { indexed++; return { search: () => [] }; } };
+    await assert.rejects(retrieve.prepare(input, cfg, deps), /outside the allowed folders/);
+    assert.equal(indexed, 0);
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+}));
+
+test('the root check ignores case on win32 and is case-sensitive elsewhere', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const shouted = path.join(dir.toUpperCase(), 'repo');
+  if (process.platform === 'win32') {
+    assert.equal(normalize({ query: 'where is it', root: shouted }, cfg).root, shouted);
+  } else {
+    throwsType(() => normalize({ query: 'where is it', root: shouted }, cfg), /outside retrieve\.allowedRoots/);
+  }
+}));
+
+test('heuristic and interpret keep a chunk set that fills the budget exactly, and drop the last chunk one token short', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir);
+  const tenTokens = 'x'.repeat(40);
+  assert.equal(estimateTokens(tenTokens), 10);
+  const candidates = [cand('a#1', tenTokens, { score: 5 }), cand('b#1', tenTokens, { score: 4 })];
+  const exact = heuristic(normalize({ query: 'cache eviction', candidates, budgetTokens: 20 }, cfg));
+  assert.deepEqual(exact.result.chunks.map((c) => c.id), ['a#1', 'b#1']);
+  assert.equal(exact.result.tokens, 20);
+  const short = heuristic(normalize({ query: 'cache eviction', candidates, budgetTokens: 19 }, cfg));
+  assert.deepEqual(short.result.chunks.map((c) => c.id), ['a#1']);
+  const p = plan(normalize({ query: 'anything here', candidates, budgetTokens: 20 }, cfg), cfg);
+  const v = interpret(answersOf(predicate('need_retrieval', 0.9), predicate('c0', 0.9), predicate('c1', 0.9)), p.ctx, cfg);
+  assert.deepEqual(v.result.chunks.map((c) => c.id), ['a#1', 'b#1']);
+  assert.equal(v.result.tokens, 20);
 }));
 
 test('plan settles without a Luna call when there are no candidates', () => withDir(async (dir) => {
@@ -259,7 +337,7 @@ test('end to end: the repository index, Luna through the fake transport, then th
   fs.writeFileSync(path.join(repo, 'src', 'cache.js'), 'export function evict(cache) {\n  // LRU eviction of the cache\n}\n');
   fs.writeFileSync(path.join(repo, 'src', 'parse.js'), 'export const parse = (s) => s.trim();\n');
   fs.writeFileSync(path.join(repo, 'README.md'), '# Demo\nCache notes\n');
-  const cfg = cfgFor(dir, { chunkLines: 2, chunkOverlap: 0, shortlist: 5 });
+  const cfg = cfgFor(dir, { chunkLines: 2, chunkOverlap: 0, shortlist: 5, allowedRoots: [dir] });
   const deps = { repoIndex: (root) => createRepoIndex(root, cfg.retrieve) };
   const prepared = await prepare(normalize({ query: 'how does cache eviction work', root: repo }, cfg), cfg, deps);
   assert.ok(prepared.candidates.length > 0);

@@ -26,7 +26,7 @@ function fixture() {
   fs.writeFileSync(path.join(repo, 'src', 'other.js'), 'export const unrelated = 1;\n');
   const config = (mode) => loadConfig({
     env: { LUNA_CORE_HOME: dir, OPENAI_API_KEY: 'sk-test-not-real' }, cwd: dir,
-    overrides: { mode, skills: { dirs: [skills] } },
+    overrides: { mode, skills: { dirs: [skills] }, retrieve: { allowedRoots: [dir] } },
   });
   return { dir, repo, config, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }

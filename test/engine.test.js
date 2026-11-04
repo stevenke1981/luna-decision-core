@@ -388,6 +388,53 @@ test('injected deps win over the factories', () => withHome(async (home) => {
   assert.equal(typeof deps.repoIndex, 'function');
 }));
 
-test('createEngine requires a config', () => {
+test('createEngine requires a config and a clock that is a function', () => withHome(async (home) => {
   assert.throws(() => createEngine({ kinds: {} }), (err) => err instanceof TypeError && /config is required/.test(err.message));
-});
+  assert.throws(() => createEngine({ config: configFor(home), now: 5 }), (err) => err instanceof TypeError && /now must be a function/.test(err.message));
+}));
+
+test('cached catalogs and indexes are rebuilt once older than cacheTtlMs; a TTL of 0 keeps none', () => withHome(async (home) => {
+  let clock = 1000;
+  const now = () => clock;
+  const made = { catalogs: 0, indexes: 0 };
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: (dirs) => { made.catalogs++; return dirs.map((d) => ({ name: d })); },
+    createRepoIndex: (root) => { made.indexes++; return { root }; },
+  };
+  const deps = buildDeps(configFor(home, { cacheTtlMs: 100 }), factories, {}, now);
+  const first = deps.loadCatalog(['a']);
+  clock = 1100;
+  assert.equal(deps.loadCatalog(['a']), first, 'exactly cacheTtlMs old is still cached');
+  clock = 1101;
+  assert.notEqual(deps.loadCatalog(['a']), first, 'older than cacheTtlMs is rebuilt');
+  assert.equal(made.catalogs, 2);
+
+  assert.equal(deps.repoIndex(home), deps.repoIndex(home));
+  assert.equal(made.indexes, 1);
+
+  const none = buildDeps(configFor(home, { cacheTtlMs: 0 }), factories, {}, now);
+  none.repoIndex(home);
+  none.repoIndex(home);
+  assert.equal(made.indexes, 3, 'with cacheTtlMs 0 every call indexes again');
+}));
+
+test('the engine re-reads a repository once its cached index is older than cacheTtlMs', () => withHome(async (home) => {
+  const repo = path.join(home, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, 'a.js'), 'export const alpha = 1;\n');
+  let clock = 0;
+  const engine = createEngine({
+    config: configFor(home, { mode: 'heuristic', cacheTtlMs: 100, retrieve: { allowedRoots: [home] } }),
+    transport: fakeLuna({}).transport,
+    now: () => clock,
+  });
+  const ask = () => engine.retrieve({ query: 'zanzibarfrob usage', root: repo });
+  assert.equal((await ask()).result.chunks.length, 0, 'nothing matches yet');
+  fs.writeFileSync(path.join(repo, 'b.js'), 'export const beta = zanzibarfrob();\n');
+  clock = 100;
+  assert.equal((await ask()).result.chunks.length, 0, 'the index is still within cacheTtlMs');
+  clock = 101;
+  const fresh = await ask();
+  assert.deepEqual(fresh.result.chunks.map((c) => c.source), ['b.js']);
+}));

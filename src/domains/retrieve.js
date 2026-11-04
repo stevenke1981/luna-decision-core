@@ -3,6 +3,8 @@
 // one relevance predicate per candidate; the rules rank the candidates by their BM25 score.
 // Candidates come from the caller or from the repository index (prepare). The text sent to Luna
 // is cut to excerptChars, and each span that looks like a secret is replaced by [redacted].
+import fs from 'node:fs';
+import path from 'node:path';
 import { GREETING, redact, certainty, indexId, mean, requireText, verdict } from '../contract.js';
 import { predicateProbability } from '../luna/answers.js';
 import { estimateTokens, excerpt, tokenize } from '../text.js';
@@ -62,7 +64,36 @@ function positiveIntOr(v, fallback, field) {
   return v;
 }
 
-/** Validates a retrieve input and returns a new object with defaults applied. */
+// Windows file names ignore case, so the root check compares folded paths there.
+const FOLD_CASE = process.platform === 'win32';
+const folded = (p) => (FOLD_CASE ? p.toLowerCase() : p);
+
+/** True when `target` is `base` itself or lies below it; both are absolute paths. */
+function isWithin(base, target) {
+  const rel = path.relative(folded(base), folded(target));
+  if (rel === '') return true;
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/**
+ * The root as an absolute path. It must lie in one of retrieve.allowedRoots, or, when that list
+ * is empty, in the working folder of the process. Chunk text from it may be sent to Luna.
+ */
+function allowedBases(cfg) {
+  const listed = cfg.retrieve.allowedRoots;
+  return listed.length > 0 ? listed : [cfg.cwd ?? process.cwd()];
+}
+
+function allowedRootOf(root, cfg) {
+  const abs = path.resolve(root);
+  const listed = cfg.retrieve.allowedRoots;
+  const bases = allowedBases(cfg);
+  if (bases.some((base) => isWithin(path.resolve(base), abs))) return abs;
+  const scope = listed.length > 0 ? 'retrieve.allowedRoots' : 'the working folder (retrieve.allowedRoots is empty)';
+  throw new TypeError(`retrieve: root ${abs} is outside ${scope}`);
+}
+
+/** Validates a retrieve input and returns a new object with defaults applied; root is absolute. */
 function normalize(input, cfg) {
   if (!isPlainObject(input)) throw new TypeError('retrieve: input must be an object');
   const query = requireText(input.query, 'retrieve: query');
@@ -72,7 +103,7 @@ function normalize(input, cfg) {
   if (input.force !== undefined && typeof input.force !== 'boolean') throw new TypeError('retrieve: force must be a boolean');
   return {
     query,
-    root: input.root ?? undefined,
+    root: input.root == null ? undefined : allowedRootOf(input.root, cfg),
     candidates: input.candidates == null ? undefined : normalizeCandidates(input.candidates),
     budgetTokens: positiveIntOr(input.budgetTokens, cfg.retrieve.budgetTokens, 'retrieve: budgetTokens'),
     force: input.force ?? false,
@@ -86,9 +117,27 @@ function shortlistOf(candidates, n) {
   return (scored ? [...candidates].sort((a, b) => b.score - a.score) : candidates).slice(0, n);
 }
 
+/** A root that is a link (symlink, junction) must still resolve inside the allowed folders. */
+function assertRealRootAllowed(root, cfg) {
+  const real = realOrSelf(root);
+  if (!allowedBases(cfg).some((base) => isWithin(realOrSelf(path.resolve(base)), real))) {
+    throw new TypeError(`retrieve: root ${root} resolves to ${real}, outside the allowed folders`);
+  }
+}
+
+function realOrSelf(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch (err) {
+    if (err.code === 'ENOENT') return p;
+    throw err;
+  }
+}
+
 /** The candidates from the repository index, when none were given and a root is. */
 async function searchRepo(input, cfg, deps) {
   if (typeof deps?.repoIndex !== 'function') throw new Error('retrieve: root given but no repoIndex dependency');
+  assertRealRootAllowed(input.root, cfg);
   const index = await deps.repoIndex(input.root);
   return index.search(input.query, cfg.retrieve.shortlist);
 }

@@ -166,3 +166,145 @@ test('createRepoIndex rejects a missing folder with an Error and bad arguments w
   type(() => createRepoIndex(dir, { ...cfgFor(dir).retrieve, maxFiles: 0 }), /maxFiles/);
   type(() => createRepoIndex(dir, { ...cfgFor(dir).retrieve, ignoreDirs: 'node_modules' }), /ignoreDirs/);
 }));
+
+// A filesystem refusal of the kinds the walk skips (see SKIPPABLE in repo.js).
+const REFUSED_CODES = ['EACCES', 'EPERM', 'EBUSY', 'ENOENT', 'ELOOP'];
+const refused = (code) => Object.assign(new Error(`${code}: refused by the test`), { code });
+const basename = (p) => path.basename(String(p));
+
+for (const code of REFUSED_CODES) {
+  test(`createRepoIndex skips a folder refused with ${code}, counts it and indexes the rest`, (t) => withDir(async (dir) => {
+    const repo = path.join(dir, 'repo');
+    writeFiles(repo, { 'open/a.js': 'const a = 1;\n', 'locked/b.js': 'const b = 2;\n' });
+    const realReaddir = fs.readdirSync;
+    t.mock.method(fs, 'readdirSync', (p, o) => {
+      if (basename(p) === 'locked') throw refused(code);
+      return realReaddir(p, o);
+    });
+    const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+    t.mock.restoreAll();
+    assert.deepEqual(index.files, ['open/a.js']);
+    assert.equal(index.skipped, 1);
+    assert.equal(index.truncated, false);
+  }));
+
+  test(`createRepoIndex skips a file refused with ${code} on read and counts it`, (t) => withDir(async (dir) => {
+    const repo = path.join(dir, 'repo');
+    writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n' });
+    const realRead = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', (p, o) => {
+      if (basename(p) === 'b.js') throw refused(code);
+      return realRead(p, o);
+    });
+    const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+    t.mock.restoreAll();
+    assert.deepEqual(index.files, ['a.js']);
+    assert.equal(index.skipped, 1);
+  }));
+}
+
+test('createRepoIndex skips a file that vanished after the listing and counts it', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'gone.js': 'g\n' });
+  const realStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (p, o) => {
+    if (basename(p) === 'gone.js') throw refused('ENOENT');
+    return realStat(p, o);
+  });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['a.js']);
+  assert.equal(index.skipped, 1);
+}));
+
+test('createRepoIndex counts every skipped folder and file in one walk', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'ok.js': 'o\n', 'l1/x.js': 'x\n', 'l2/y.js': 'y\n', 'f.js': 'f\n' });
+  const realReaddir = fs.readdirSync;
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readdirSync', (p, o) => {
+    if (['l1', 'l2'].includes(basename(p))) throw refused('EACCES');
+    return realReaddir(p, o);
+  });
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    if (basename(p) === 'f.js') throw refused('EBUSY');
+    return realRead(p, o);
+  });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['ok.js']);
+  assert.equal(index.skipped, 3);
+}));
+
+test('createRepoIndex rethrows a filesystem error that is not on the skip list', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n' });
+  t.mock.method(fs, 'readdirSync', () => { throw refused('EIO'); });
+  assert.throws(() => createRepoIndex(repo, cfgFor(dir).retrieve), (e) => e.code === 'EIO');
+  t.mock.restoreAll();
+}));
+
+test('createRepoIndex stops once maxWalkMs has passed, keeps what it indexed and reports truncated', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n', 'c.js': 'c\n' });
+  let time = 0;
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    const text = realRead(p, o);
+    time += 1000;
+    return text;
+  });
+  const index = createRepoIndex(repo, cfgFor(dir, { maxWalkMs: 1500 }).retrieve, { now: () => time });
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['a.js', 'b.js']);
+  assert.equal(index.truncated, true);
+  assert.equal(index.skipped, 0);
+}));
+
+test('createRepoIndex stops exactly when maxWalkMs has elapsed, not one file later', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n' });
+  let time = 0;
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    const text = realRead(p, o);
+    time += 1000;
+    return text;
+  });
+  const index = createRepoIndex(repo, cfgFor(dir, { maxWalkMs: 1000 }).retrieve, { now: () => time });
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['a.js']);
+  assert.equal(index.truncated, true);
+}));
+
+test('createRepoIndex is not truncated when the time limit passes only after the last file', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n' });
+  let time = 0;
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    const text = realRead(p, o);
+    time += 1000;
+    return text;
+  });
+  const index = createRepoIndex(repo, cfgFor(dir, { maxWalkMs: 1500 }).retrieve, { now: () => time });
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['a.js', 'b.js']);
+  assert.equal(index.truncated, false);
+}));
+
+test('createRepoIndex reports truncated when maxFiles leaves an indexable file out, and not when it fits exactly', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n', 'c.js': 'c\n' });
+  const cut = createRepoIndex(repo, cfgFor(dir, { maxFiles: 2 }).retrieve);
+  assert.deepEqual(cut.files, ['a.js', 'b.js']);
+  assert.equal(cut.truncated, true);
+  const exact = createRepoIndex(repo, cfgFor(dir, { maxFiles: 3 }).retrieve);
+  assert.equal(exact.truncated, false);
+}));
+
+test('createRepoIndex rejects a non-positive maxWalkMs and a clock that is not a function', () => withDir(async (dir) => {
+  const type = (fn, re) => assert.throws(fn, (e) => e instanceof TypeError && re.test(e.message));
+  type(() => createRepoIndex(dir, { ...cfgFor(dir).retrieve, maxWalkMs: 0 }), /maxWalkMs/);
+  type(() => createRepoIndex(dir, cfgFor(dir).retrieve, { now: 5 }), /now must be a function/);
+}));
