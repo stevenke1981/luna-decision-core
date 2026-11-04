@@ -140,12 +140,24 @@ test('memory_recall heuristic keeps memories scoring at least half the top score
     const expected = hits.filter((h) => h.score >= 0.5 * hits[0].score).map((h) => h.id);
     const r = memoryRecall.heuristic(input, cfg).result;
     assert.deepEqual(r.memories.map((m) => m.id), expected);
-    assert.equal(r.considered, 2);
+    assert.equal(r.considered, 3, 'two lexical hits plus one recent fill-in');
     assert.ok(r.memories.every((m) => m.probability === null));
     const one = memoryRecall.heuristic({ ...input, limit: 1 }, cfg).result;
     assert.deepEqual(one.memories.map((m) => m.id), [hits[0].id]);
     const none = await prepared(memoryRecall, { query: 'zebra' }, cfg, deps);
-    assert.deepEqual(memoryRecall.heuristic(none, cfg).result, { memories: [], considered: 0 });
+    assert.deepEqual(memoryRecall.heuristic(none, cfg).result, { memories: [], considered: 3 }, 'fill-ins never count for the rules');
+  });
+});
+
+test('memory_recall prepare tops the shortlist up with recent memories so Luna sees paraphrases', async () => {
+  await withWorld({}, async ({ cfg, store, deps }) => {
+    const pref = store.add({ type: 'user', text: 'The user prefers answers in Traditional Chinese' });
+    store.add({ type: 'project', text: 'release checklist' });
+    const input = await prepared(memoryRecall, { query: 'which language do I reply with' }, cfg, deps);
+    assert.ok(input.memories.some((m) => m.id === pref.id && m.score === 0));
+    const planned = memoryRecall.plan(input, cfg);
+    assert.equal(planned.questions.length, 2);
+    assert.equal(memoryRecall.heuristic(input, cfg).result.memories.length, 0);
   });
 });
 

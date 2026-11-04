@@ -73,6 +73,7 @@ test('tokenize splits camelCase, snake_case and CJK bigrams', () => {
   const t = tokenize('parseConfig load_env 模型路由');
   for (const w of ['parseconfig', 'parse', 'config', 'load_env', 'load', 'env', '模型', '型路', '路由']) assert.ok(t.includes(w), w);
   assert.ok(estimateTokens('模型路由') === 4);
+  assert.deepEqual(tokenize('answers queries class status'), ['answers', 'answer', 'queries', 'query', 'class', 'status']);
   assert.equal(excerpt('abcdefghij', 5), 'abcd…');
   assert.ok(excerpt('a'.repeat(50) + 'END', 20, true).endsWith('END'));
   assert.equal(similarity('use pnpm always', 'always use pnpm'), 1);

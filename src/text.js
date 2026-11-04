@@ -6,6 +6,17 @@ const WORD = /[\p{L}\p{N}_]+/gu;
 const CJK = /[㐀-鿿豈-﫿぀-ヿ가-힯]/u;
 const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'is', 'are', 'be', 'it', 'this', 'that', 'with', 'as', 'at', 'by', 'from', 'do', 'does', 'how', 'what', 'i', 'you', 'we', 'me', 'my']);
 
+// A plural folds to its singular as an extra term ("answers" also counts as "answer"), so a
+// query and a text that differ only in number still share a term. Not a full stemmer.
+const MIN_PLURAL = 4;
+const NOT_PLURAL = /(ss|us|is|ous)$/;
+
+function singularOf(word) {
+  if (word.length < MIN_PLURAL || !word.endsWith('s') || NOT_PLURAL.test(word)) return null;
+  if (word.endsWith('ies') && word.length > MIN_PLURAL) return `${word.slice(0, -3)}y`;
+  return word.slice(0, -1);
+}
+
 /**
  * Lower-case terms: latin words (split on camelCase and snake_case as well as kept whole) and
  * CJK character bigrams (unigrams for a lone character). Stop words are dropped.
@@ -26,6 +37,8 @@ export function tokenize(text) {
     const lower = word.toLowerCase();
     const parts = word.split(/_|(?<=[a-z0-9])(?=[A-Z])/).map((p) => p.toLowerCase()).filter(Boolean);
     if (!STOP.has(lower) && lower.length > 1) out.push(lower);
+    const singular = singularOf(lower);
+    if (singular) out.push(singular);
     if (parts.length > 1) for (const p of parts) if (!STOP.has(p) && p.length > 1) out.push(p);
   }
   return out;

@@ -100,7 +100,8 @@ test('plan forces a skill named as /name, or a distinctive hyphenated name as a 
 
   const planned = skills.plan(norm({ task: 'use /docs-writer and write tests', catalog: CATALOG }), cfg);
   assert.deepEqual(planned.ctx.forced.map((s) => s.name), ['docs-writer']);
-  assert.deepEqual(planned.ctx.shortlist.map((s) => s.name), ['testing']);
+  // 'tests' also folds to 'test', which matches tdd-workflow's 'Test driven'.
+  assert.deepEqual(planned.ctx.shortlist.map((s) => s.name), ['testing', 'tdd-workflow']);
 });
 
 test('plan matches names with regex characters literally', () => {
@@ -133,9 +134,15 @@ test('plan shortlists by BM25 without forced skills, caps the shortlist and asks
   assert.ok(!('settled' in out));
   assert.deepEqual(out.state, {
     task: 'use /docs-writer and write tests',
-    skills: [{ id: 's0', name: 'testing', description: 'Write unit tests and test suites for a module.' }],
+    skills: [
+      { id: 's0', name: 'testing', description: 'Write unit tests and test suites for a module.' },
+      { id: 's1', name: 'tdd-workflow', description: 'Test driven development: red, green, refactor.' },
+    ],
   });
-  assert.deepEqual(out.questions, [{ type: 'predicate', name: 's0', instructions: 'Should skill s0 ("testing") be loaded for this task?' }]);
+  assert.deepEqual(out.questions, [
+    { type: 'predicate', name: 's0', instructions: 'Should skill s0 ("testing") be loaded for this task?' },
+    { type: 'predicate', name: 's1', instructions: 'Should skill s1 ("tdd-workflow") be loaded for this task?' },
+  ]);
 
   const capped = skills.plan(norm({ task: 'tests tests for the server', catalog: WIDE }), cfgWith({ skills: { shortlist: 2 } }));
   assert.deepEqual(capped.questions.map((q) => q.name), ['s0', 's1']);

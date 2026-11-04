@@ -106,8 +106,18 @@ function normalizeRecall(input, cfg) {
 }
 
 async function prepareRecall(input, cfg, deps) {
-  const memories = requireStore(deps, RECALL).search(input.query, cfg.memory.shortlist);
-  return { ...input, memories };
+  const store = requireStore(deps, RECALL);
+  const limit = cfg.memory.shortlist;
+  const hits = store.search(input.query, limit);
+  // Lexical search misses paraphrases ("answer in" vs "prefers answers"), so the shortlist is
+  // topped up with the most recently updated other memories (score 0) for Luna to judge.
+  const seen = new Set(hits.map((m) => m.id));
+  const recent = store.list()
+    .filter((m) => !seen.has(m.id))
+    .sort((a, b) => (a.updated < b.updated ? 1 : a.updated > b.updated ? -1 : 0))
+    .slice(0, Math.max(0, limit - hits.length))
+    .map((m) => ({ ...m, score: 0 }));
+  return { ...input, memories: [...hits, ...recent] };
 }
 
 function planRecall(input) {
@@ -145,8 +155,11 @@ function interpretRecall(answers, ctx, cfg) {
 /** Rules: the memories scoring at least RECALL_RATIO of the top BM25 score, capped at `limit`. */
 function heuristicRecall(input) {
   if (input.memories.length === 0) return noMatch();
-  const top = Math.max(...input.memories.map((m) => m.score));
-  const picked = input.memories.filter((m) => m.score >= RECALL_RATIO * top).slice(0, input.limit);
+  // Only lexical hits count for the rules; score-0 fill-ins are for Luna to judge.
+  const top = Math.max(...input.memories.map((m) => m.score ?? 0));
+  const picked = top > 0
+    ? input.memories.filter((m) => (m.score ?? 0) >= RECALL_RATIO * top).slice(0, input.limit)
+    : [];
   return verdict(
     { memories: picked.map((m) => memoryOut(m, null)), considered: input.memories.length },
     null,
