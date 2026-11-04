@@ -150,12 +150,16 @@ Heuristic: forced, then BM25 hits with score ≥ `LEXICAL_RATIO`(0.6) × top sco
 
 Input: `{ query, root?: string, candidates?: Chunk[], budgetTokens?, force?: boolean }`,
 `Chunk = { id, source, startLine?, endLine?, text, score? }`. Prepare: `candidates ??= root ?
-deps.repoIndex(root).search(query, cfg.retrieve.shortlist) : []`.
+deps.repoIndex(root).search(query, cfg.retrieve.shortlist) : []`. `root` is resolved to an
+absolute path and must lie in `retrieve.allowedRoots` (empty: under `cfg.cwd`, the folder the
+config was loaded for); before indexing, its real path (links resolved) must lie there too. Luna
+sees at most `shortlist` candidates, best score first.
 
 Index: `chunkFile(relPath, text, {chunkLines, chunkOverlap}) → Chunk[]` (line windows, ids
 `relPath#startLine`, 1-based inclusive lines, posix paths). `createRepoIndex(root, rcfg)` walks
 `root` synchronously (skip `ignoreDirs`, non-listed extensions, files > `maxFileBytes`, files with
-a NUL byte in the first 8 KB; stop at `maxFiles`), BM25 over `source + text`; returns frozen
+a NUL byte in the first 8 KB; skip folders/files refused with EACCES/EPERM/EBUSY/ENOENT/ELOOP,
+counted in `skipped`; stop at `maxFiles` or after `maxWalkMs`, setting `truncated`), BM25 over `source + text`; returns frozen
 `{ search(query, k) → Chunk[] with score, files, chunks }`.
 
 Plan: no candidates → settled `{needed: false, chunks: [], tokens: 0, considered: 0}` reason
@@ -182,8 +186,10 @@ per line): `{ id: 'm_' + 10 hex, type, text, source, created, updated }` (ISO st
 `list()` (copies), `get(id)`, `search(query, k) → records + score` (BM25 on text), `add({type,
 text, source})`, `update(id, {text?, type?})` (bumps `updated`; unknown id → Error), `remove(id) →
 boolean`, `warnings` (unparseable lines are skipped and reported, never dropped from disk until
-the next write rewrites valid records only). Writes are atomic (temp file + rename), create the
-folder, and **refuse** a text matching `SECRET`. Reads the file on each call (no stale cache).
+the next write rewrites valid records only). Writes are atomic (temp file + rename, retried on
+Windows EPERM/EBUSY/EACCES) and run under an O_EXCL lock file `<file>.lock` (wait up to ~2 s; a
+lock older than 10 s is stale and removed); they create the folder, append lines skipped on load
+to `<file>.rejected` (no raw text for secret lines), and **refuse** a text matching `SECRET`. Reads the file on each call (no stale cache).
 
 `memory_recall` input `{ query, limit? }`; prepare: `memories = deps.store.search(query,
 cfg.memory.shortlist)`. None → settled `{memories: [], considered: 0}`. State `{ query, memories:
@@ -240,8 +246,9 @@ Heuristic: compact = force || ratio ≥ softRatio. Actions: tool older than 6 tu
 `applyCompression(segments, actions, ccfg) → { segments, tokensBefore, tokensAfter }` (new
 array): drop removes; summarize replaces text with `extractiveSummary(text, summaryChars)` =
 first 2 lines + lines matching `/error|fail|exception|warn|todo|fixme|decid|result|錯誤|失敗|決定|結論/i`
-+ last 2 lines, deduplicated, in order, cut to summaryChars, prefixed `[summarized N→M tokens] `,
-and recomputes tokens. Finalize sets `result.segments`, `tokensBefore`, `tokensAfter`,
++ last 2 lines, deduplicated, in order, cut to summaryChars, prefixed `[summarized N→M tokens] `
+(M counts the whole new text), and recomputes tokens; `compress.summaryChars` ≥ 64. The pure
+helpers live in `src/domains/compress-apply.js`, re-exported by `compress.js`. Finalize sets `result.segments`, `tokensBefore`, `tokensAfter`,
 `ratioAfter`.
 
 Result: `{ compact, actions, segments|null, tokensBefore, tokensAfter, ratioAfter }`.
@@ -251,7 +258,8 @@ Result: `{ compact, actions, segments|null, tokensBefore, tokensAfter, ratioAfte
 `createEngine({ config, transport?, kinds?, deps?, ledger? })` → frozen `{ decide(kind, input),
 route, skills, retrieve, recall, remember, compress, stats() }`. `kinds` defaults to the registry
 (tests inject stubs). `deps` defaults: lazy `store` = `createMemoryStore(cfg.memory.path)`,
-`loadCatalog` cached by `dirs.join('|')`, `repoIndex(root)` cached by resolved root. Unknown kind →
+`loadCatalog` cached by `dirs.join('|')`, `repoIndex(root)` cached by resolved root; both caches expire
+after `cfg.cacheTtlMs` (0 = no cache). Unknown kind →
 TypeError. `stats()` → `{ decisions, lunaCalls, cost, fallbacks, errors, byKind: {kind: {decisions,
 luna, rules, settled, fallbacks}} }` (returns a copy).
 
@@ -282,7 +290,11 @@ schemas (`additionalProperties: false`). Result `content: [{type: 'text', text: 
 
 ## 7. Safety
 
-- The API key only from env; never logged, never in config output, never in the ledger.
+- The API key only from env; never logged, never in config output, never in the ledger. It is
+  a non-enumerable config property; Luna error bodies have it replaced by `[key]` (`scrub`).
+- Config trust: `luna.url`, `memory.path`, `ledger.path`, `skills.dirs`, `retrieve.allowedRoots`
+  are accepted only from an explicit config file, `LUNA_CORE_CONFIG` or the home config, never
+  from a working-folder `luna-core.config.json`. `luna.url` must be https or loopback.
 - Memory refuses secrets (contract `SECRET`) both in Luna state and on disk.
 - Ledger stores no user text.
 - The HTTP server binds loopback by default.

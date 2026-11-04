@@ -1,0 +1,60 @@
+{
+  "route": {
+    "models": [
+      {
+        "id": "claude-haiku-5-5",
+        "tier": 1,
+        "contextWindow": 200000,
+        "capabilities": ["tools", "vision"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "strengths": "fast and cheap: lookups, routine edits, worker tasks"
+      },
+      {
+        "id": "gpt-6.1-terra",
+        "tier": 2,
+        "contextWindow": 400000,
+        "capabilities": ["tools"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "strengths": "general coding agent: features, focused edits, debugging in one repository"
+      },
+      {
+        "id": "claude-sonnet-5-5",
+        "tier": 2,
+        "contextWindow": 200000,
+        "capabilities": ["tools", "vision"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "strengths": "strong coder: features, focused debugging, reviews"
+      },
+      {
+        "id": "gpt-6.1-sol",
+        "tier": 2,
+        "contextWindow": 400000,
+        "capabilities": ["tools"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh"],
+        "strengths": "alternative GPT-6.1 coding model; edit to describe its measured strengths"
+      },
+      {
+        "id": "claude-opus-5-5",
+        "tier": 3,
+        "contextWindow": 200000,
+        "capabilities": ["tools", "vision"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "strengths": "deepest reasoning: architecture, subtle bugs, security, long multi-part work"
+      },
+      {
+        "id": "gpt-6-astra",
+        "tier": 3,
+        "contextWindow": 400000,
+        "capabilities": ["tools"],
+        "local": false,
+        "efforts": ["low", "medium", "high", "xhigh"],
+        "strengths": "alternative GPT-6 model; edit to describe its measured strengths"
+      }
+    ]
+  }
+}
