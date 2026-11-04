@@ -2,10 +2,15 @@
 // each old segment keep, summarize or drop it. Luna answers the predicate `compact_now` and one
 // choice per asked segment; the rules escalate toward targetRatio (gate) and decide alone in
 // `heuristic` mode. Everything here is pure: finalize applies the actions to the segments it was
-// given, and nothing mutates its input.
+// given, and nothing mutates its input. The action helpers and summaries live in compress-apply.js.
 import { verdict, certainty, mean, requireText, indexId, redact } from '../contract.js';
 import { estimateTokens, excerpt } from '../text.js';
 import { choiceAnswer, predicateProbability } from '../luna/answers.js';
+import {
+  KEEP, SUMMARIZE, DROP, ACTIONS, isPosInt, totalTokens, actionOf, sizeAfter, summariesFor, applyCompression,
+} from './compress-apply.js';
+
+export { applyCompression, extractiveSummary } from './compress-apply.js';
 
 /** Tool output older than this many turns is dropped by the rules. */
 export const TOOL_DROP_AGE = 6;
@@ -17,16 +22,8 @@ export const ASSISTANT_SUMMARIZE_TOKENS = 800;
 export const COMPACT_PROBABILITY = 0.5;
 
 const ROLES = ['system', 'user', 'assistant', 'tool'];
-const KEEP = 'keep';
-const SUMMARIZE = 'summarize';
-const DROP = 'drop';
-const ACTIONS = [KEEP, SUMMARIZE, DROP];
 const GOAL_CHARS = 1000;
-const FIRST_LINES = 2;
-const LAST_LINES = 2;
-const HEAD_SHARE = 0.6;
 const DECIMALS = 2;
-const KEY_LINE = /error|fail|exception|warn|todo|fixme|decid|result|錯誤|失敗|決定|結論/i;
 const UNDER_SOFT = 'under the soft limit';
 const NOTHING_ELIGIBLE = 'nothing eligible';
 const ESCALATED = 'rules escalated to reach the target ratio';
@@ -44,7 +41,6 @@ const ACTION_CHOICES = Object.freeze([
 ]);
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const isPosInt = (v) => Number.isInteger(v) && v > 0;
 const isNonNegInt = (v) => Number.isInteger(v) && v >= 0;
 const fmt = (x) => x.toFixed(DECIMALS);
 
@@ -105,10 +101,6 @@ function currentTurn(segments) {
   return segments.reduce((max, s) => Math.max(max, s.turn), 0);
 }
 
-function totalTokens(segments) {
-  return segments.reduce((sum, s) => sum + s.tokens, 0);
-}
-
 /** Segments compaction may touch: not pinned, not system, and older than the recent turns. */
 function eligibleSegments(segments, keepRecentTurns) {
   const newest = currentTurn(segments) - keepRecentTurns;
@@ -124,103 +116,12 @@ function oldestFirst(segments) {
   return [...segments].sort((a, b) => a.turn - b.turn);
 }
 
-/** The action for a segment id; a segment without an action is kept. */
-function actionOf(actions, id) {
-  return Object.hasOwn(actions, id) ? actions[id] : KEEP;
-}
-
 function ratioOf(input) {
   return totalTokens(input.segments) / input.window;
 }
 
 function isUnderSoft(input, cfg) {
   return !input.force && ratioOf(input) < cfg.compress.softRatio;
-}
-
-// ---- summaries -----------------------------------------------------------------------------
-
-/**
- * The lines that carry a text: its first and last non-blank lines and every line that marks an
- * error, failure, decision or result; cut to `maxChars` (head and tail kept, an ellipsis between).
- * @param {string} text
- * @param {number} maxChars positive integer
- * @returns {string}
- */
-export function extractiveSummary(text, maxChars) {
-  if (typeof text !== 'string') throw new TypeError('compress: summary text must be a string');
-  if (!isPosInt(maxChars)) throw new TypeError('compress: summary maxChars must be a positive integer');
-  const lines = text.split(/\r?\n/);
-  const content = lines.map((_, i) => i).filter((i) => lines[i].trim() !== '');
-  const picked = new Set([
-    ...content.slice(0, FIRST_LINES),
-    ...content.slice(-LAST_LINES),
-    ...content.filter((i) => KEY_LINE.test(lines[i])),
-  ]);
-  const kept = [...picked].sort((a, b) => a - b).map((i) => lines[i]).join('\n');
-  return cutMiddle(kept, maxChars);
-}
-
-function cutMiddle(s, max) {
-  if (s.length <= max) return s;
-  const head = Math.ceil((max - 1) * HEAD_SHARE);
-  return `${s.slice(0, head)}…${s.slice(s.length - (max - 1 - head))}`;
-}
-
-function summaryMarker(before, after) {
-  return `[summarized ${before}→${after} tokens] `;
-}
-
-/**
- * The summarized segment when it is strictly smaller than the segment, else null. The marker counts
- * inside summaryChars: the body gets the budget left after it. The marker's token count is at most
- * the body budget, so bounding it by summaryChars keeps its digits (and the length) within bounds.
- */
-function summarizeSegment(segment, summaryChars) {
-  const budget = Math.max(1, summaryChars - summaryMarker(segment.tokens, summaryChars).length);
-  const body = extractiveSummary(segment.text, budget);
-  const text = `${summaryMarker(segment.tokens, estimateTokens(body))}${body}`;
-  const tokens = estimateTokens(text);
-  return tokens < segment.tokens ? { ...segment, text, tokens } : null;
-}
-
-/** Summary per segment id (null where a summary would not shrink the segment). */
-function summariesFor(segments, summaryChars) {
-  return new Map(segments.map((s) => [s.id, summarizeSegment(s, summaryChars)]));
-}
-
-/** Tokens a segment occupies after `action`; a summarize that does not shrink keeps the size. */
-function sizeAfter(segment, action, summaries) {
-  if (action === DROP) return 0;
-  const summary = action === SUMMARIZE ? summaries.get(segment.id) : null;
-  return summary ? summary.tokens : segment.tokens;
-}
-
-/**
- * Applies the actions to the segments. Segments without an action are kept; a summarize that
- * would not shrink a segment keeps it. Returns new objects; the input is not touched.
- * @param {object[]} segments normalized segments
- * @param {Record<string, 'keep'|'summarize'|'drop'>} actions
- * @param {{summaryChars:number}} ccfg the compress config
- * @returns {{segments:object[], tokensBefore:number, tokensAfter:number}}
- */
-export function applyCompression(segments, actions, ccfg) {
-  checkActions(actions, segments);
-  const out = [];
-  for (const seg of segments) {
-    const action = actionOf(actions, seg.id);
-    if (action === DROP) continue;
-    const summary = action === SUMMARIZE ? summarizeSegment(seg, ccfg.summaryChars) : null;
-    out.push(summary ?? { ...seg });
-  }
-  return { segments: out, tokensBefore: totalTokens(segments), tokensAfter: totalTokens(out) };
-}
-
-function checkActions(actions, segments) {
-  const ids = new Set(segments.map((s) => s.id));
-  for (const [id, action] of Object.entries(actions)) {
-    if (!ids.has(id)) throw new TypeError(`compress: action for unknown segment "${id}"`);
-    if (!ACTIONS.includes(action)) throw new TypeError(`compress: unknown action "${action}" for segment "${id}"`);
-  }
 }
 
 // ---- rules: escalation and heuristic -------------------------------------------------------
@@ -286,7 +187,6 @@ function shapeResult(input, compact, actions, tokensBefore, tokensAfter) {
 }
 
 // ---- plan, interpret -----------------------------------------------------------------------
-
 
 function stateSegment(seg, id, current, excerptChars) {
   return {

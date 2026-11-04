@@ -125,8 +125,12 @@ function reasonsOf(selected) {
   return selected.map(({ skill, reason }) => `${reason}: ${skill.name}`);
 }
 
-/** The BM25 leaders: the best hit when it reaches LEXICAL_MIN, and each hit within LEXICAL_RATIO of it. */
-function lexicalPicks(shortlist) {
+/**
+ * The BM25 leaders: the best hit when it reaches LEXICAL_MIN, and each hit within LEXICAL_RATIO of it.
+ * @param {{skill: object, score: number}[]} shortlist hits, best first
+ * @returns {{skill: object, probability: null, reason: 'lexical'}[]}
+ */
+export function lexicalPicks(shortlist) {
   const top = shortlist[0]?.score ?? 0;
   if (top < LEXICAL_MIN) return [];
   return shortlist

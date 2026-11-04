@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { skills, LEXICAL_RATIO, LEXICAL_MIN } from '../src/domains/skills.js';
+import { skills, LEXICAL_RATIO, LEXICAL_MIN, lexicalPicks } from '../src/domains/skills.js';
 import { loadConfig } from '../src/config.js';
 import { askLuna } from '../src/luna/client.js';
 import { answersByName } from '../src/luna/answers.js';
@@ -229,6 +229,23 @@ test('heuristic keeps the lexical leaders: best hit at LEXICAL_MIN, hits within 
 
   const capped = skills.heuristic(norm({ task: 'sql joins query planner', catalog: LEX, maxSkills: 1 }), cfg);
   assert.deepEqual(names(capped.result), ['sql-joins']);
+});
+
+test('lexicalPicks keeps a hit at exactly LEXICAL_RATIO of the top score and drops one just below', () => {
+  const hit = (name, score) => ({ skill: { name }, score });
+  const names = (picks) => picks.map((p) => p.skill.name);
+  assert.equal(LEXICAL_RATIO * 5, 3, 'the boundary is exact in floating point');
+  const equal = lexicalPicks([hit('top', 5), hit('equal', 3)]);
+  assert.deepEqual(names(equal), ['top', 'equal']);
+  assert.deepEqual(equal.map((p) => p.reason), ['lexical', 'lexical']);
+  assert.deepEqual(names(lexicalPicks([hit('top', 5), hit('below', 2.9999)])), ['top']);
+});
+
+test('lexicalPicks needs a top score of at least LEXICAL_MIN, and returns nothing for an empty shortlist', () => {
+  const hit = (name, score) => ({ skill: { name }, score });
+  assert.deepEqual(lexicalPicks([hit('at-min', LEXICAL_MIN)]).map((p) => p.skill.name), ['at-min']);
+  assert.deepEqual(lexicalPicks([hit('under', LEXICAL_MIN - 1e-9)]), []);
+  assert.deepEqual(lexicalPicks([]), []);
 });
 
 test('heuristic and interpret return the same result shape', () => {

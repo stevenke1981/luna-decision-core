@@ -7,6 +7,7 @@ import {
   compress, applyCompression, extractiveSummary, escalate,
   TOOL_DROP_AGE, TOOL_SUMMARIZE_TOKENS, ASSISTANT_SUMMARIZE_TOKENS,
 } from '../src/domains/compress.js';
+import * as applyModule from '../src/domains/compress-apply.js';
 import { loadConfig, lunaOptions } from '../src/config.js';
 import { answersByName } from '../src/luna/answers.js';
 import { askLuna } from '../src/luna/client.js';
@@ -76,6 +77,16 @@ function deepFreeze(o) {
 // A plan in the soft-to-hard band with one old tool segment and one recent segment.
 function bandSegments() {
   return [seg('old', 'tool', 0, log('old')), seg('cur', 'user', 9, 'now')];
+}
+
+const CURRENT_TOKENS = 5;
+
+/** Two segments that sum to `total` tokens in a window of `window`: an old tool segment and the current one. */
+function exactInput(total, window) {
+  return compress.normalize({
+    window,
+    segments: [seg('old', 'tool', 0, 'x', { tokens: total - CURRENT_TOKENS }), seg('cur', 'user', 10, 'now', { tokens: CURRENT_TOKENS })],
+  });
 }
 
 test('normalize rejects duplicate segment ids', () => {
@@ -198,6 +209,37 @@ test('compact_now is asked only between the soft and hard limits', () => {
   assert.equal(asksCompactNow(0.7), true, 'in the band: asked');
   assert.equal(asksCompactNow(0.7, { force: true }), false, 'forced: not asked');
   assert.equal(asksCompactNow(0.9), false, 'at or above hard: not asked');
+});
+
+test('a segment exactly keepRecentTurns older than the current turn is eligible, one turn newer is not', () => {
+  assert.equal(CFG.compress.keepRecentTurns, 2, 'the turns below assume the default');
+  const segments = [
+    seg('old', 'tool', 0, log('o', 20)),
+    seg('edge', 'assistant', 8, log('e', 20)), // 10 - 2: eligible
+    seg('newer', 'assistant', 9, log('n', 20)), // 9 is past the newest eligible turn
+    seg('cur', 'user', 10, 'now'),
+  ];
+  const p = planOrFail(inputAt(segments, 0.7));
+  assert.deepEqual(p.ctx.asked.map((a) => a.id).sort(), ['edge', 'old']);
+});
+
+test('a ratio exactly at the hard limit compacts without asking compact_now', () => {
+  assert.equal(CFG.compress.hardRatio, 85 / 100, 'the fixture sits exactly on the hard limit');
+  const input = exactInput(85, 100);
+  const p = planOrFail(input);
+  assert.ok(!p.questions.some((q) => q.name === 'compact_now'), 'compact_now is asked only below the hard limit');
+  const v = compress.interpret(answersFor(p.questions, { choose: () => DROP }), p.ctx, CFG);
+  assert.equal(v.result.compact, true);
+  assert.equal(v.result.actions.old, DROP);
+  assert.deepEqual(v.reasons, ['ratio 0.85 at or above the hard limit']);
+});
+
+test('a ratio exactly at the soft limit is not under it: plan asks Luna and the rules compact', () => {
+  assert.equal(CFG.compress.softRatio, 60 / 100, 'the fixture sits exactly on the soft limit');
+  const input = exactInput(60, 100);
+  const p = planOrFail(input);
+  assert.ok(p.questions.some((q) => q.name === 'compact_now'));
+  assert.equal(compress.heuristic(input, CFG).result.compact, true);
 });
 
 test('force compacts under the soft limit and does not ask compact_now', () => {
@@ -344,6 +386,40 @@ test('escalate never touches pinned, system or recent segments, even when still 
   assert.equal(res.actions.t1, DROP, 'the only eligible segment is escalated to drop');
 });
 
+test('escalation pass 2 drops tool segments only: a summarized assistant segment stays a summary', () => {
+  const input = escalationInput(4960);
+  const res = escalate({}, input, CFG);
+  assert.deepEqual(res.actions, { t1: DROP, a3: SUMMARIZE });
+  const applied = applyCompression(input.segments, res.actions, CFG.compress);
+  assert.ok(applied.tokensAfter > CFG.compress.targetRatio * input.window, 'still above the target, yet the assistant summary is not dropped');
+});
+
+test('escalation does not count a move that saves no tokens as a change', () => {
+  const input = compress.normalize({
+    window: 10000,
+    segments: [seg('small', 'tool', 1, 'abc', { tokens: 1 }), seg('r6', 'user', 6, 'recent', { tokens: 9000 })],
+  });
+  const res = escalate({}, input, CFG);
+  assert.equal(res.changed, false);
+  assert.deepEqual(res.actions, {});
+});
+
+test('the rules summarize tool output above 500 tokens and assistant text above 800, not at those sizes', () => {
+  const segments = [
+    seg('tool-at', 'tool', 5, log('a'), { tokens: TOOL_SUMMARIZE_TOKENS }),
+    seg('tool-over', 'tool', 5, log('b'), { tokens: TOOL_SUMMARIZE_TOKENS + 1 }),
+    seg('asst-at', 'assistant', 5, log('c'), { tokens: ASSISTANT_SUMMARIZE_TOKENS }),
+    seg('asst-over', 'assistant', 5, log('d'), { tokens: ASSISTANT_SUMMARIZE_TOKENS + 1 }),
+    seg('cur', 'user', 10, 'now'),
+  ];
+  // force keeps the usage far below the target, so escalation never changes the rule actions.
+  const input = compress.normalize({ window: 100000, segments, force: true });
+  const v = compress.heuristic(input, CFG);
+  assert.deepEqual(v.result.actions, {
+    'tool-at': KEEP, 'tool-over': SUMMARIZE, 'asst-at': KEEP, 'asst-over': SUMMARIZE, cur: KEEP,
+  });
+});
+
 test('gate returns source luna+rules only when the rules changed Luna result', () => {
   const luna = { result: { compact: true, actions: { t1: KEEP, a3: KEEP } }, confidence: 0.8, reasons: ['compact_now 0.90'] };
   const input = escalationInput(4900);
@@ -414,6 +490,26 @@ test('a summary, marker included, stays within summaryChars', () => {
   }
 });
 
+test('the summary marker reports the tokens of the whole summarized text at every budget', () => {
+  const segments = compress.normalize({ window: 9000, segments: [seg('long', 'tool', 0, log('L', 200))] }).segments;
+  for (let summaryChars = 40; summaryChars <= 400; summaryChars += 7) {
+    const [out] = applyCompression(segments, { long: SUMMARIZE }, { summaryChars }).segments;
+    const m = /^\[summarized (\d+)→(\d+) tokens\] /.exec(out.text);
+    assert.ok(m, `the summary starts with its marker at summaryChars ${summaryChars}`);
+    assert.equal(Number(m[1]), segments[0].tokens, 'the marker names the original tokens');
+    assert.equal(Number(m[2]), out.tokens, `marker ${m[2]} for a ${out.tokens}-token summary at summaryChars ${summaryChars}`);
+    assert.ok(out.text.length <= summaryChars, `${out.text.length} chars for summaryChars ${summaryChars}`);
+  }
+});
+
+test('a summary that is not smaller than its segment does not replace it', () => {
+  // The marker makes the summary of 'abc' 7 tokens: a 7-token segment is kept, an 8-token one summarized.
+  const same = compress.normalize({ window: 1000, segments: [seg('same', 'assistant', 0, 'abc', { tokens: 7 })] }).segments;
+  assert.equal(applyCompression(same, { same: SUMMARIZE }, CFG.compress).segments[0].text, 'abc');
+  const bigger = compress.normalize({ window: 1000, segments: [seg('bigger', 'assistant', 0, 'abc', { tokens: 8 })] }).segments;
+  assert.match(applyCompression(bigger, { bigger: SUMMARIZE }, CFG.compress).segments[0].text, /^\[summarized 8→7 tokens\] abc$/);
+});
+
 test('applyCompression rejects an unknown segment id or action', () => {
   const segments = compress.normalize({ window: 100, segments: [seg('keep', 'user', 0, 'x')] }).segments;
   assertTypeError(() => applyCompression(segments, { nope: DROP }, CFG.compress), /unknown segment "nope"/);
@@ -430,6 +526,12 @@ test('a summarize that would not shrink a segment keeps it, and the verdict repo
   const v = compress.interpret(answersFor(p.questions, { choose: () => SUMMARIZE }), p.ctx, CFG);
   assert.equal(v.result.actions.tiny, KEEP, 'reported as keep: nothing to gain');
   assert.equal(v.result.actions.big, SUMMARIZE);
+});
+
+test('compress re-exports the helpers from compress-apply.js, as the same functions', () => {
+  assert.equal(applyCompression, applyModule.applyCompression);
+  assert.equal(extractiveSummary, applyModule.extractiveSummary);
+  assert.deepEqual([...applyModule.ACTIONS], [KEEP, SUMMARIZE, DROP]);
 });
 
 test('finalize applies the actions when compacting and sets the result fields', () => {
