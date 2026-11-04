@@ -12,6 +12,7 @@
 Set-Location D:\luna-decision-core
 node --version
 node .\bin\luna-core.js --version
+node .\bin\luna-core.js doctor --mode heuristic
 node .\bin\luna-core.js route --mode heuristic --task "重新命名一個區域變數"
 ```
 
@@ -54,9 +55,14 @@ notepad D:\luna-decision-core\.env.local
 設定後檢查：
 
 ```powershell
+luna-core doctor
 luna-core config
 luna-core probe
 ```
+
+`doctor` 離線檢查有效設定與路徑，不呼叫 API、不寫入資料。它會區分 Luna
+決策模型與實際執行工作的候選模型，金鑰只顯示 set／unset；`doctor --json`
+可提供給自動化程式。金鑰存在不代表已驗證有效。
 
 `config` 的 `apiKey` 顯示 `set` 或 `unset`。`probe` 會實際呼叫一次 Luna，產生 API 費用；成功時可查看 `source`、`calls`、`tokens`、`cost`。沒有金鑰或呼叫失敗時，以 exit code 1 結束。
 
@@ -111,6 +117,16 @@ luna-core route --task "修正多執行緒快取的資料競爭" --context-token
 ```
 
 查看 `result.model`、`result.effort` 與 `result.fallbackChain`。這些是供外層程式採用的建議；這個指令本身不執行主模型。
+
+要帶入完整 `steps` 或 `candidates`，可使用 JSON：
+
+```powershell
+luna-core route --input .\examples\route-input.json --mode heuristic --format text
+```
+
+預設維持 JSON；`--format text` 適合人閱讀。六類決策都支援 `--input FILE|-`，
+不可與個別輸入旗標混用。詳細的 stdin 範例與中文任務選英文 skill 設定見
+[決策工作流程](decision-workflow.zh-TW.md)。
 
 ### 選技能
 
@@ -265,7 +281,10 @@ Invoke-RestMethod http://127.0.0.1:8792/v1/stats
 | `source: rules` | 使用本機規則；auto 降級時另有 `error` 原因 |
 | `source: settled` | 已能確定結果，不需要呼叫 Luna |
 | `result` | 實際要給外層程式採用的決策 |
-| `calls`、`tokens`、`cost` | Luna 成功回覆的呼叫與用量資訊；cost 是未快取價估計上限 |
+| `calls`、`tokens`、`cost` | 成功返回 body 的 transport 次數與用量；cost 是基本輸入單價估計，不是帳單或保證上限 |
+
+`calls` 不包含拋出錯誤的 HTTP 請求或快取協商重試，故 `calls: 0` 不能證明
+沒有 HTTP 請求。費用估計未計入快取寫入、地區或長上下文調整。
 
 預設家目錄是 `%USERPROFILE%\.luna-decision-core`：
 
@@ -283,7 +302,8 @@ CLI 以 exit code `0` 表示成功、`1` 表示執行失敗、`2` 表示指令�
 | 想完全離線 | 在子指令後加 `--mode heuristic` |
 | auto 模式得到 rules | 查看輸出的 `error`；Luna 失敗或信心不足時會降級 |
 | `root ... is outside ...` | 將實際專案加入明確指定設定檔的 `retrieve.allowedRoots` |
-| 技能選不到 | 確認 `skills.dirs` 指向技能父目錄，以及 `<技能>/SKILL.md` 存在 |
+| 技能選不到 | 先以 `doctor` 檢查路徑；中英文無共同詞時，可在設定檔開啟 `skills.semanticFallback` 並提供適當候選目錄 |
+| `config: unknown field` | 更正欄位拼字或移除未定義的附加欄位；不再默默套用預設值 |
 | MCP 有工具卻沒有自動換模型 | 工具提供建議，換模型由宿主能力或自訂 agent 流程執行 |
 | HTTP 403 | 服務拒絕帶 Origin 的瀏覽器請求，請使用伺服器端程式呼叫 |
 | HTTP 415 | 設定 `Content-Type: application/json` |

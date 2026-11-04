@@ -1,0 +1,8 @@
+{
+  "task": "請建立分支並提交修正",
+  "catalog": [
+    { "name": "git-workflow", "description": "Manage Git branches, commits and pull requests" },
+    { "name": "photo-editing", "description": "Edit photographs, adjust contrast and crop images" }
+  ],
+  "maxSkills": 1
+}

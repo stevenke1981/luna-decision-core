@@ -6,11 +6,15 @@ One decision layer for coding-agent harnesses. OpenAI's Luna (`gpt-6-luna`, Deci
 
 > 與 `luna-decision-openai`（Codex 用的本機 proxy）不同。本 repo 是可被 harness 呼叫的函式庫、CLI、HTTP sidecar 與 MCP server。
 
-> **驗證狀態（2026-11-05）**：Windows 上 Node 22.15.0 與 24.20.0 各通過 392 個測試；實際 CLI、HTTP 與 MCP stdio 程序已完成離線驗收。完整範圍與未執行項目見 [驗收紀錄](docs/team/v1/acceptance.md)。範例中的耗時與模型機率僅供示意。
+> **先前基準驗證（2026-11-05）**：Windows 上 Node 22.15.0 與 24.20.0 各通過 392 個測試；實際 CLI、HTTP 與 MCP stdio 程序已完成離線驗收。這是 v1 的歷史紀錄，完整範圍見 [v1 驗收紀錄](docs/team/v1/acceptance.md)；本次新增變更另見下方改善驗證報告。範例中的耗時與模型機率僅供示意。
 
 Node.js ≥ 22.15，ESM，**零依賴**（`package.json` 沒有 dependencies，不需要 `npm install`）。
 
 第一次使用可先看 [繁體中文使用說明](docs/usage.zh-TW.md)，依序完成離線試跑、金鑰設定與 Claude Code／Codex 的 MCP 接線。
+
+新增的 [決策工作流程](docs/decision-workflow.zh-TW.md) 說明 `doctor` 離線診斷、
+JSON 檔案／stdin 輸入、文字輸出，以及中文任務搭配英文 skills 的選用設定。
+本次修正與測試範圍見 [改善驗證報告](docs/team/v2/verification.md)。
 
 ## 目錄
 
@@ -122,6 +126,16 @@ Library 呼叫 `engine.decide(kind, input)` 時，kind 名稱為 `route`、`skil
 
 Heuristic 模式不需要金鑰，可以先跑通。
 
+不註冊全域指令也能使用：
+
+```powershell
+node .\bin\luna-core.js doctor --mode heuristic
+node .\bin\luna-core.js route --input .\examples\route-input.json --mode heuristic --format text
+```
+
+`doctor` 只檢查本機設定，不呼叫 API、不寫入記憶或 ledger。改用 `doctor --json`
+可取得機器可讀報告；`auto` 或 `luna` 模式缺少金鑰時會回傳 exit 1。
+
 ```powershell
 # Get the public repository first, if needed:
 git clone https://github.com/stevenke1981/luna-decision-core.git
@@ -185,10 +199,12 @@ cp .env.example .env.local           # then edit .env.local
 
 ## 5. CLI 參考
 
-CLI 啟動時會先讀取 env 檔。輸出為 JSON 寫到 stdout；錯誤寫到 stderr。Exit code：`0` 成功、`1` 執行錯誤、`2` 用法錯誤。
+CLI 啟動時會先讀取 env 檔。決策預設輸出 JSON 到 stdout；可加 `--format text`
+閱讀摘要、理由與結果。錯誤寫到 stderr。Exit code：`0` 成功、`1` 執行錯誤、`2` 用法錯誤。
 
 | 指令 | 用途 | 參數 |
 |---|---|---|
+| `luna-core doctor` | 離線檢查有效設定、金鑰是否已設定、路徑與路由候選；不驗證帳號使用權 | `--json`（預設文字） |
 | `luna-core probe` | 呼叫一次 Luna（route 的固定任務），印出決策、費用與 token。需要金鑰 | — |
 | `luna-core route` | 選模型與 effort | `--task T`、`--context-tokens N`、`--requires a,b`、`--local-only` |
 | `luna-core skills` | 選要載入的 skill | `--task T`、`--dir D`（可重複） |
@@ -200,6 +216,19 @@ CLI 啟動時會先讀取 env 檔。輸出為 JSON 寫到 stdout；錯誤寫到 
 | `luna-core mcp` | 啟動 MCP stdio server | — |
 | `luna-core config` | 印出有效設定（不含金鑰） | — |
 | 全域旗標 | `--mode auto\|luna\|heuristic`、`--config FILE`、`--version`、`--help` | — |
+
+六類決策命令都支援 `--input FILE` 或 `--input -`（stdin），本體為該類型的
+完整 JSON 物件，最多 1 MiB，接受 UTF-8 BOM。不可與同一命令的個別輸入旗標
+混用；`--mode`、`--config`、`--format` 可一起使用。例如：
+
+```bash
+luna-core route --input examples/route-input.json --mode heuristic --format text
+luna-core route --input - --mode heuristic < examples/route-input.json
+```
+
+`route` 的 JSON 可帶入 `steps` 與 `candidates`，讓 agents 傳遞實際驗證結果與
+允許的模型清單。JSON 內的相對路徑以命令的工作目錄為基準。
+既有的 `compress --file` 也採用相同的 1 MiB 檔案大小限制。
 
 CLI 範例：
 
@@ -344,15 +373,16 @@ node --input-type=module -e "import {loadConfig} from './src/config.js'; loadCon
 | `luna.model` | `gpt-6-luna` | 決策模型 |
 | `luna.timeoutMs` | `4000` | 單次呼叫逾時（正整數，毫秒） |
 | `luna.cacheMode` | `explicit` | `explicit`（標記 cache breakpoint）、`implicit`、`off` |
-| `luna.maxQuestionsPerCall` | `16` | 每次呼叫最多幾題，超過則分批（見第 10 節） |
+| `luna.maxQuestionsPerCall` | `16` | 每批 1..400 題，超過設定值則分批（見第 10 節） |
 | `route.effortQuantile` | `0.5` | 取 Luna effort 分布的哪個分位數（0 到 1） |
 | `route.modelQuantile` | `0.5` | 取 Luna 模型分布的哪個分位數，模型依 tier 排序 |
-| `route.contextHeadroom` | `1.2` | 模型的 contextWindow 須 ≥ contextTokens × 此值才合格 |
+| `route.contextHeadroom` | `1.2` | 須 ≥ 1；模型的 contextWindow 須 ≥ contextTokens × 此值才合格 |
 | `route.models` | 見下表 | 候選模型清單 |
 | `skills.dirs` | `[]` | 掃描 `<dir>/<skill>/SKILL.md` 的資料夾清單 |
 | `skills.shortlist` | `12` | BM25 先取前幾名給 Luna 判斷 |
 | `skills.maxSkills` | `3` | 最多選幾個 skill |
 | `skills.threshold` | `0.5` | Luna 給出的 P(應載入) 達此值才選用 |
+| `skills.semanticFallback` | `false` | 無文字命中且未強制指定 skill 時，可將目錄前 `shortlist` 個候選交給 Luna，適合中英文混用 |
 | `retrieve.allowedRoots` | `[]` | `root` 可位於的資料夾（絕對路徑）；空清單＝僅工作資料夾之下。只能來自信任的設定檔 |
 | `retrieve.maxWalkMs` | `5000` | repo 走訪的時間上限（毫秒），逾時只用已索引部分 |
 | `retrieve.shortlist` | `12` | 送給 Luna 判斷的候選 chunk 數 |
@@ -416,10 +446,10 @@ node --input-type=module -e "import {loadConfig} from './src/config.js'; loadCon
 ## 10. 費用
 
 - **計費方式**：Decisions API 只計輸入 token。本 repo 的 client 把輸出視為免費（`src/luna/client.js`）。
-- **費用數字是上限**：`decision.cost` 以未快取輸入價 USD 0.10 / 1M tokens 計算（`USD_PER_INPUT_TOKEN`）。快取讀取比較便宜，所以實際帳單通常較低。實際金額以 OpenAI 帳單為準；價格變動時請改這個常數。
-- **快取**：所有呼叫共用同一段 rubric，它放在請求最前面，並標記 explicit cache breakpoint，同時帶 `prompt_cache_key`（`luna-decision-core/v1`）。命中數回報於 `decision.tokens.cached`。**快取命中率尚未在本 repo 實測。** 若 API 以含 "cache" 字樣的 400 拒絕 explicit cache，程式會改用 implicit 重試，之後不再送 explicit。
+- **費用數字是基本單價估計**：`decision.cost` 以未快取輸入價 USD 0.10 / 1M tokens 計算（`USD_PER_INPUT_TOKEN`）。它沒有計入快取讀取折扣、快取寫入費用、地區與長上下文調整，因此不是帳單金額，也不是保證上限。實際金額以 OpenAI 帳單為準；價格變動時請檢查這個常數。
+- **快取**：所有呼叫共用同一段 rubric，它放在請求最前面，並標記 explicit cache breakpoint，同時帶 `prompt_cache_key`（`luna-decision-core/v2`）。命中數回報於 `decision.tokens.cached`。**快取命中率尚未在本 repo 實測。** 若 API 以含 "cache" 字樣的 400 拒絕 explicit cache，程式會改用 implicit 重試；相容性紀錄依端點、模型與帳號範圍隔離。`off` 會送出沒有 breakpoint 的 explicit 模式，停用快取，也不會重試成 implicit。
 - **批次**：每次呼叫最多 `luna.maxQuestionsPerCall`（預設 16）題。超過時分成多次呼叫，依序送出，每批都重送 rubric 與 state，因此輸入 token 隨批次數成長。例如 `compress` 最多問 24 段（`maxSegmentsAsked`）再加上 `compact_now`，共最多 25 題，會分成 2 次呼叫。
-- **次數與用量**：`decision.calls` 與 `engine.stats().lunaCalls` 記錄呼叫次數；`engine.stats().cost` 為各次上限的加總。
+- **次數與用量**：`decision.calls` 與 `engine.stats().lunaCalls` 記錄成功返回 body 的 transport 次數，不包含拋出錯誤的 HTTP 請求或快取協商重試。因此 `calls: 0` 不能單獨證明沒有 HTTP 請求。`engine.stats().cost` 為基本單價估計的加總。
 - **不呼叫 Luna 的情況**：`heuristic` 模式；`retrieve` 沒有候選；`memory_recall` 沒有候選；`memory_write` 遇到疑似秘密或與既有記憶相似度 ≥ 0.95；`compress` 用量低於 `softRatio`；以及暫停期間。
 
 **失敗與暫停**（`src/luna/client.js`）：
@@ -430,7 +460,15 @@ node --input-type=module -e "import {loadConfig} from './src/config.js'; loadCon
 | 401 或 403 | 10 分鐘 |
 | 429 | 依 `Retry-After`（上限 10 分鐘）；沒有此標頭則 60 秒 |
 
-暫停以「端點 URL + 金鑰」為單位。暫停期間，`auto` 直接退回規則，`luna` 直接失敗，不會每次都等逾時。
+暫停以「端點 URL + 金鑰雜湊 + organization + project」為單位。暫停期間，
+`auto` 直接退回規則，`luna` 直接失敗，不會每次都等逾時。較早送出的成功請求
+不會清掉其他並行請求剛建立的有效暫停。
+
+格式錯誤的回答會在每批返回時被拒絕，後續批次不再送出。HTTP headers 之後
+讀取 body 的逾時也會觸發暫停。批次與快取行為依據
+[Decisions 官方指南](https://developers.openai.com/api/docs/guides/decisions) 與
+[API reference](https://developers.openai.com/api/reference/resources/decisions/methods/create)
+核對（2026-11-05）。
 
 ## 11. 紀錄與隱私
 
@@ -442,6 +480,8 @@ node --input-type=module -e "import {loadConfig} from './src/config.js'; loadCon
 
 ## 12. 已知限制
 
+- **設定採嚴格檢查。** 未定義欄位或拼字錯誤會報錯；例如 `luna.timeotMs` 不能取代 `luna.timeoutMs`。`route.contextHeadroom` 須 ≥ 1，單批問題數須為 1..400。自訂設定若含未定義的附加欄位，升級前應先移除或更正。
+- **語意候選是有界的。** `skills.semanticFallback` 預設關閉；開啟後只在沒有文字命中且沒有強制指定 skill 時，檢查目錄前 `shortlist` 個。結果會列出考慮數量；大型目錄仍宜先由外層縮小候選範圍。
 - **記憶庫以鎖檔協調多個程序。** 每次寫入都在 `<file>.lock`（O_EXCL）內做「讀取、修改、暫存檔 + rename」；搶不到鎖會等待最多約 2 秒後失敗，超過 10 秒的鎖視為殘留而移除。讀不懂、欄位錯誤或疑似秘密的行在下次寫入時移到 `<file>.rejected`（疑似秘密者只記行號與原因，不存原文）。
 - **Skill 目錄與 repo 索引快取 `cacheTtlMs`（預設 30 秒）。** 長時間執行的 `serve`／`mcp` 在快取過期後會看到 `SKILL.md` 與原始碼的變化；設為 `0` 則每次重建。
 - **檢索的 `root` 有範圍限制。** `root` 必須位於 `retrieve.allowedRoots` 之一；清單為空時，只能位於載入設定時的工作資料夾之下。`root` 若是連結（symlink、junction），其實際路徑也必須在允許範圍內。被索引的片段可能送給 Luna。

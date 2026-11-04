@@ -1,0 +1,9 @@
+{
+  "task": "修正快取失效問題，保留現有 API 並補上回歸測試",
+  "contextTokens": 8000,
+  "requires": ["tools"],
+  "steps": [
+    { "kind": "read", "command": "inspect cache implementation", "failed": false },
+    { "kind": "verify", "command": "node --test test/cache.test.js", "failed": true }
+  ]
+}
