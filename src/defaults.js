@@ -42,6 +42,9 @@ export const DEFAULTS = {
     shortlist: 12,
     maxSkills: 3,
     threshold: 0.5,
+    // Opt in to asking Luna about a bounded catalog when lexical matching finds nothing.
+    // Useful when the task and skill descriptions use different languages.
+    semanticFallback: false,
   },
   retrieve: {
     // Folders a `root` may lie in (absolute paths). Empty: only the working folder of the

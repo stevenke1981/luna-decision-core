@@ -20,7 +20,9 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
 
 function isPlainObject(v) {
-  return v != null && typeof v === 'object' && !Array.isArray(v);
+  if (v == null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const prototype = Object.getPrototypeOf(v);
+  return prototype === Object.prototype || prototype === null;
 }
 
 const orDefault = (v, fallback) => (v === undefined ? fallback : v);
@@ -130,6 +132,18 @@ function check(cond, msg) {
   if (!cond) throw new Error(`config: ${msg}`);
 }
 
+/** Reject misspelled settings before merging, so a typo cannot silently keep a default. */
+function checkOverrideKeys(value, defaults = DEFAULTS, prefix = '') {
+  check(isPlainObject(value), `${prefix || 'overrides'} must be an object`);
+  const unsafe = unsafeKey(value);
+  check(!unsafe, `"${unsafe}" is not allowed as a config key`);
+  for (const [key, entry] of Object.entries(value)) {
+    const field = prefix ? `${prefix}.${key}` : key;
+    check(Object.hasOwn(defaults, key), `unknown field "${field}"; allowed fields: ${Object.keys(defaults).join(', ')}`);
+    if (entry !== undefined && isPlainObject(defaults[key])) checkOverrideKeys(entry, defaults[key], field);
+  }
+}
+
 /** An https URL without credentials, or http to 127.0.0.1 or localhost (tests, local proxies). */
 function isAllowedLunaUrl(text) {
   let url;
@@ -143,7 +157,10 @@ function isAllowedLunaUrl(text) {
 }
 
 const prob = (v) => Number.isFinite(v) && v >= 0 && v <= 1;
-const posInt = (v) => Number.isInteger(v) && v > 0;
+const posInt = (v) => Number.isSafeInteger(v) && v > 0;
+const nonEmptyText = (v) => typeof v === 'string' && v.trim().length > 0 && !v.includes('\0');
+const textList = (v) => Array.isArray(v) && v.every(nonEmptyText);
+const optionalPath = (v) => v === '' || nonEmptyText(v);
 
 /** Checks every route.models entry: unique ids, positive numbers, known efforts, typed optional fields. */
 function checkModels(models) {
@@ -151,12 +168,14 @@ function checkModels(models) {
   const ids = new Set();
   for (const m of models) {
     check(isPlainObject(m), 'route.models entries must be objects');
-    check(typeof m.id === 'string' && m.id && !ids.has(m.id), `route.models: missing or duplicate id "${m.id}"`);
+    const modelKeys = ['id', 'tier', 'contextWindow', 'capabilities', 'local', 'efforts', 'strengths'];
+    check(Object.keys(m).every((key) => modelKeys.includes(key)), `route.models: unknown field; allowed fields: ${modelKeys.join(', ')}`);
+    check(nonEmptyText(m.id) && m.id === m.id.trim() && !ids.has(m.id), `route.models: missing, untrimmed or duplicate id "${m.id}"`);
     ids.add(m.id);
     check(posInt(m.tier), `route.models ${m.id}: tier must be a positive integer`);
     check(posInt(m.contextWindow), `route.models ${m.id}: contextWindow must be a positive integer`);
-    check(Array.isArray(m.efforts) && m.efforts.length > 0 && m.efforts.every((e) => EFFORTS.includes(e)), `route.models ${m.id}: efforts must list known efforts`);
-    check(Array.isArray(m.capabilities) && m.capabilities.every((x) => typeof x === 'string'), `route.models ${m.id}: capabilities must be an array of strings`);
+    check(Array.isArray(m.efforts) && m.efforts.length > 0 && m.efforts.every((e) => EFFORTS.includes(e)) && new Set(m.efforts).size === m.efforts.length, `route.models ${m.id}: efforts must list known efforts without repeats`);
+    check(textList(m.capabilities), `route.models ${m.id}: capabilities must be an array of strings (non-empty)`);
     check(typeof m.local === 'boolean', `route.models ${m.id}: local must be true or false`);
     check(typeof m.strengths === 'string', `route.models ${m.id}: strengths must be a string`);
   }
@@ -164,11 +183,16 @@ function checkModels(models) {
 
 /** Throws a clear error for the first invalid field. */
 export function validateConfig(c) {
+  check(isPlainObject(c), 'configuration must be an object');
+  for (const section of ['luna', 'route', 'skills', 'retrieve', 'memory', 'compress', 'ledger', 'server']) {
+    check(isPlainObject(c[section]), `${section} must be an object`);
+  }
   check(MODES.includes(c.mode), `mode must be ${MODES.join('|')}; got "${c.mode}"`);
   check(['explicit', 'implicit', 'off'].includes(c.luna.cacheMode), 'luna.cacheMode must be explicit|implicit|off');
-  check(isAllowedLunaUrl(c.luna.url), 'luna.url must be an https URL without credentials (http only for 127.0.0.1 or localhost)');
-  check(posInt(c.luna.timeoutMs), 'luna.timeoutMs must be a positive integer');
-  check(posInt(c.luna.maxQuestionsPerCall), 'luna.maxQuestionsPerCall must be a positive integer');
+  check(nonEmptyText(c.luna.url) && isAllowedLunaUrl(c.luna.url), 'luna.url must be an https URL without credentials (http only for 127.0.0.1 or localhost)');
+  check(nonEmptyText(c.luna.model) && c.luna.model === c.luna.model.trim(), 'luna.model must be a non-empty string without surrounding whitespace');
+  check(posInt(c.luna.timeoutMs) && c.luna.timeoutMs <= 2_147_483_647, 'luna.timeoutMs must be an integer from 1 to 2147483647');
+  check(posInt(c.luna.maxQuestionsPerCall) && c.luna.maxQuestionsPerCall <= 400, 'luna.maxQuestionsPerCall must be an integer from 1 to 400');
   check(prob(c.minConfidence), 'minConfidence must be 0..1');
   check(Array.isArray(c.ladder) && c.ladder.length >= 2 && c.ladder.length <= 10, 'ladder needs 2 to 10 efforts');
   for (let i = 0; i < c.ladder.length; i++) {
@@ -176,19 +200,30 @@ export function validateConfig(c) {
     if (i > 0) check(EFFORTS.indexOf(c.ladder[i]) > EFFORTS.indexOf(c.ladder[i - 1]), 'ladder must run from least to most effort without repeats');
   }
   check(prob(c.route.effortQuantile) && prob(c.route.modelQuantile), 'route quantiles must be 0..1');
+  check(Number.isFinite(c.route.contextHeadroom) && c.route.contextHeadroom >= 1, 'route.contextHeadroom must be a finite number >= 1');
   checkModels(c.route.models);
+  check(textList(c.skills.dirs), 'skills.dirs must be an array of non-empty folder paths');
+  check(typeof c.skills.semanticFallback === 'boolean', 'skills.semanticFallback must be true or false');
   check(posInt(c.skills.shortlist) && posInt(c.skills.maxSkills) && prob(c.skills.threshold), 'skills: shortlist/maxSkills positive, threshold 0..1');
   check(posInt(c.retrieve.shortlist) && posInt(c.retrieve.budgetTokens) && prob(c.retrieve.threshold), 'retrieve: shortlist/budgetTokens positive, threshold 0..1');
-  check(Array.isArray(c.retrieve.allowedRoots) && c.retrieve.allowedRoots.every((r) => typeof r === 'string' && path.isAbsolute(r)), 'retrieve.allowedRoots must list absolute paths');
+  check(textList(c.retrieve.allowedRoots) && c.retrieve.allowedRoots.every((r) => path.isAbsolute(r)), 'retrieve.allowedRoots must list absolute paths');
   check(posInt(c.retrieve.maxWalkMs), 'retrieve.maxWalkMs must be a positive integer');
-  check(Number.isInteger(c.cacheTtlMs) && c.cacheTtlMs >= 0, 'cacheTtlMs must be a non-negative integer');
-  check(posInt(c.retrieve.chunkLines) && c.retrieve.chunkOverlap >= 0 && c.retrieve.chunkOverlap < c.retrieve.chunkLines, 'retrieve: chunkOverlap must be below chunkLines');
+  check(Number.isSafeInteger(c.cacheTtlMs) && c.cacheTtlMs >= 0, 'cacheTtlMs must be a non-negative integer');
+  check(posInt(c.retrieve.chunkLines) && Number.isSafeInteger(c.retrieve.chunkOverlap) && c.retrieve.chunkOverlap >= 0 && c.retrieve.chunkOverlap < c.retrieve.chunkLines, 'retrieve: chunkOverlap must be a non-negative integer below chunkLines');
+  check(posInt(c.retrieve.maxFileBytes) && posInt(c.retrieve.maxFiles) && posInt(c.retrieve.excerptChars), 'retrieve: maxFileBytes, maxFiles and excerptChars must be positive integers');
+  check(textList(c.retrieve.extensions) && c.retrieve.extensions.every((extension) => extension.startsWith('.')), 'retrieve.extensions must list file extensions starting with a dot');
+  check(textList(c.retrieve.ignoreDirs), 'retrieve.ignoreDirs must be an array of non-empty folder names');
   check(prob(c.memory.recallThreshold) && prob(c.memory.durableThreshold) && prob(c.memory.duplicateSimilarity), 'memory thresholds must be 0..1');
+  check(posInt(c.memory.shortlist) && posInt(c.memory.maxRecall), 'memory.shortlist and memory.maxRecall must be positive integers');
+  check(optionalPath(c.memory.path), 'memory.path must be a path string');
   const k = c.compress;
   check(prob(k.softRatio) && prob(k.hardRatio) && prob(k.targetRatio) && k.targetRatio <= k.softRatio && k.softRatio <= k.hardRatio, 'compress: need targetRatio <= softRatio <= hardRatio, all 0..1');
-  check(Number.isInteger(k.keepRecentTurns) && k.keepRecentTurns >= 0, 'compress.keepRecentTurns must be >= 0');
+  check(Number.isSafeInteger(k.keepRecentTurns) && k.keepRecentTurns >= 0, 'compress.keepRecentTurns must be >= 0');
   check(posInt(k.maxSegmentsAsked) && posInt(k.excerptChars) && posInt(k.summaryChars), 'compress: maxSegmentsAsked, excerptChars and summaryChars must be positive integers');
   check(k.summaryChars >= MIN_SUMMARY_CHARS, `compress.summaryChars must be at least ${MIN_SUMMARY_CHARS}, room for the summary marker and some text`);
+  check(typeof c.ledger.enabled === 'boolean', 'ledger.enabled must be true or false');
+  check(optionalPath(c.ledger.path), 'ledger.path must be a path string');
+  check(nonEmptyText(c.server.host), 'server.host must be a non-empty host string');
   check(Number.isInteger(c.server.port) && c.server.port >= 0 && c.server.port < 65536, 'server.port must be 0..65535');
 }
 
@@ -217,7 +252,12 @@ export function loadConfig({ env = process.env, cwd = process.cwd(), file, overr
   const explicit = Boolean(file || env.LUNA_CORE_CONFIG);
   const { file: used, json } = readConfigFile(configFileCandidates({ env, cwd, file }), { explicit, cwdFile: path.join(cwd, CONFIG_FILE) });
   const home = homeDir(env);
+  checkOverrideKeys(json);
+  checkOverrideKeys(overrides ?? {});
   const merged = deepMerge(deepMerge(deepMerge(DEFAULTS, json), envOverrides(env)), overrides ?? {});
+  // Validate before derived defaults are filled in: a false/zero path must not become the
+  // default path, and a null section must not produce an unrelated property-access error.
+  validateConfig(deepMerge(merged, { route: { models: Array.isArray(merged.route.models) ? merged.route.models.map(withModelDefaults) : merged.route.models } }));
   const c = completeConfig(merged, { home, used, env, cwd });
   Object.defineProperty(c, 'apiKey', { value: env.LUNA_API_KEY || env.OPENAI_API_KEY || '', enumerable: false });
   validateConfig(c);
