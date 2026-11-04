@@ -44,6 +44,11 @@ export const DEFAULTS = {
     threshold: 0.5,
   },
   retrieve: {
+    // Folders a `root` may lie in (absolute paths). Empty: only the working folder of the
+    // process and what lies below it. Every indexed chunk may be sent to Luna.
+    allowedRoots: [],
+    // A repository walk stops after this long; what was indexed so far is used.
+    maxWalkMs: 5000,
     shortlist: 12,
     threshold: 0.5,
     budgetTokens: 4000,
@@ -76,6 +81,9 @@ export const DEFAULTS = {
     excerptChars: 400,
     summaryChars: 400,
   },
+  // The engine caches the skills catalog and repository indexes; entries older than this are
+  // rebuilt, so a long-running serve or mcp sees edited files.
+  cacheTtlMs: 30000,
   ledger: {
     enabled: true,
     path: '',

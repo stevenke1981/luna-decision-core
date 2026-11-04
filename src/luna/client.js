@@ -6,12 +6,15 @@
 // Luna for that endpoint and key, so it costs one failure, not one per decision.
 import { createHash } from 'node:crypto';
 import { RUBRIC, CACHE_KEY } from '../rubric.js';
+import { redact } from '../contract.js';
 
 // Uncached input; output is free. Cached reads cost less, so this is an upper bound.
 export const USD_PER_INPUT_TOKEN = 0.10 / 1e6;
 const PAUSE_MS = { timeout: 30_000, auth: 600_000, rate: 60_000 };
 const MAX_RETRY_AFTER_MS = 600_000;
 const QUESTION_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+// What replaces the literal API key when a server echoes it back in an error message.
+export const KEY_MARK = '[key]';
 
 const pausedUntil = new Map();
 let explicitCacheRejected = false;
@@ -20,6 +23,19 @@ let explicitCacheRejected = false;
 export function resetLunaState() {
   pausedUntil.clear();
   explicitCacheRejected = false;
+}
+
+/**
+ * Text from a response body, safe to put in an error message: the literal API key is replaced
+ * by KEY_MARK first, then every secret-looking span is redacted.
+ * @param {unknown} text
+ * @param {string} [apiKey]
+ * @returns {string}
+ */
+export function scrubDetail(text, apiKey) {
+  const str = String(text);
+  const withoutKey = apiKey ? str.split(apiKey).join(KEY_MARK) : str;
+  return redact(withoutKey);
 }
 
 function pauseKey(opts) {
@@ -123,7 +139,8 @@ export async function postDecision(opts, state, questions) {
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) pause(opts, PAUSE_MS.auth);
     if (res.status === 429) pause(opts, retryAfterMs(res));
-    throw new Error(`Luna HTTP ${res.status}: ${body?.error?.message ?? 'no error body'}`);
+    const detail = scrubDetail(body?.error?.message ?? 'no error body', opts.apiKey);
+    throw new Error(`Luna HTTP ${res.status}: ${detail}`);
   }
   pausedUntil.delete(pauseKey(opts));
   return body;

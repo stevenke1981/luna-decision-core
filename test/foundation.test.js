@@ -152,3 +152,57 @@ test('postDecision: retries without an explicit cache breakpoint once, then paus
     resetLunaState();
   }
 });
+
+test('validateQuestions refuses an unknown question type and a score above 10 levels', () => {
+  assert.throws(() => validateQuestions([{ type: 'weird', name: 'w', instructions: 'x' }]), /unknown type "weird"/);
+  const levels = Array.from({ length: 11 }, (_, i) => ({ value: i }));
+  assert.throws(() => validateQuestions([{ type: 'score', name: 's', instructions: 'x', levels }]), /2 to 10/);
+});
+
+test('postDecision pauses for the Retry-After seconds on 429 and does not call again meanwhile', async () => {
+  resetLunaState();
+  let hits = 0;
+  const server = await serve((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      hits++;
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '7' });
+      res.end('{"error":{"message":"slow down"}}');
+    });
+  });
+  try {
+    const opts = { url: `http://127.0.0.1:${server.address().port}/v1/decisions`, apiKey: 'k-rate', model: 'gpt-6-luna', timeoutMs: 2000 };
+    await assert.rejects(postDecision(opts, {}, [P('x')]), /HTTP 429: slow down/);
+    await assert.rejects(postDecision(opts, {}, [P('x')]), /paused for 7 s/);
+    assert.equal(hits, 1, 'the paused key sends no second request');
+  } finally {
+    server.close();
+    resetLunaState();
+  }
+});
+
+test('postDecision pauses after a timeout and reports the pause', async () => {
+  resetLunaState();
+  const server = await serve(() => {});
+  try {
+    const opts = { url: `http://127.0.0.1:${server.address().port}/v1/decisions`, apiKey: 'k-slow', model: 'gpt-6-luna', timeoutMs: 50 };
+    await assert.rejects(postDecision(opts, {}, [P('x')]), (err) => err.name === 'TimeoutError');
+    await assert.rejects(postDecision(opts, {}, [P('x')]), /paused for 30 s/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    resetLunaState();
+  }
+});
+
+test('loadConfig refuses a config file that is not JSON or not an object', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-cfg-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'luna-core.config.json'), '{ not json');
+    assert.throws(() => loadConfig({ env: { LUNA_CORE_HOME: dir }, cwd: dir }), /is not valid JSON/);
+    fs.writeFileSync(path.join(dir, 'luna-core.config.json'), '[1, 2]');
+    assert.throws(() => loadConfig({ env: { LUNA_CORE_HOME: dir }, cwd: dir }), /must be a JSON object/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
