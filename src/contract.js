@@ -51,8 +51,24 @@ export function indexId(prefix, i) {
 }
 
 // Words that mark a hard or deep request, English and Chinese. Shared by route and others.
-export const HARD_TASK = /\b(design|architect|architecture|refactor|race|deadlock|concurren|security|vulnerab|prove|proof|optimi[sz]e|performance|migrat|why|root cause|debug|investigate)\b|設計|架構|重構|除錯|根因|為什麼|為何|優化|效能|安全|並行|遷移/i;
-export const DEEP_QUESTION = /\b(how (does|do|did|is|are|come)|explain (how|why)|in depth|deep dive|trade-?offs?|algorithm|complexity|analy[sz]e|analysis|compare|comparison)\b|深入|原理|分析|比較|權衡|取捨|演算法|複雜度|推導|證明|怎麼運作|如何運作|運作機制/i;
+export const HARD_TASK = /\b(?:design\w*|architect\w*|refactor\w*|race|races|deadlock\w*|concurren\w*|security|secure|vulnerab\w*|prove|proof\w*|optimi[sz]\w*|performance|migrat\w*|why|root cause|debug\w*|investigat\w*)\b|設計|架構|重構|除錯|根因|為什麼|為何|優化|效能|安全|並行|遷移/i;
+export const DEEP_QUESTION = /\b(?:how (?:does|do|did|is|are|come)|explain (?:how|why)|in depth|deep dive|trade-?offs?|algorithm\w*|complexity|analy[sz]\w*|analys[ie]s|compar\w*)\b|深入|原理|分析|比較|權衡|取捨|演算法|複雜度|推導|證明|怎麼運作|如何運作|運作機制/i;
 export const GREETING = /^\s*(hi|hello|hey|yo|thanks|thank you|ok|okay|你好|嗨|謝謝|好的?|收到)\W*$/i;
 // A secret-looking string: never stored in memory, never sent in a memory_write state.
-export const SECRET = /\b(sk-[A-Za-z0-9_-]{16,}|sk-or-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)|\b(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*\S{6,}|密碼\s*[:：=]\s*\S+/i;
+export const SECRET = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)|\b(sk-[A-Za-z0-9_-]{16,}|sk-or-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})|\b(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*\S{6,}|密碼\s*[:：=]\s*\S+/i;
+
+const SECRET_ALL = new RegExp(SECRET.source, 'gi');
+export const REDACTED = '[redacted]';
+
+/** `text` with every secret-looking span replaced by REDACTED. */
+export function redact(text) {
+  return String(text).replace(SECRET_ALL, REDACTED);
+}
+
+/** A deep copy of plain JSON data with every string redacted. Applied to every Luna state. */
+export function redactDeep(value) {
+  if (typeof value === 'string') return redact(value);
+  if (Array.isArray(value)) return value.map(redactDeep);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
+  return value;
+}

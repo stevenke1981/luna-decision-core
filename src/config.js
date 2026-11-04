@@ -95,7 +95,7 @@ export function validateConfig(c) {
     ids.add(m.id);
     check(posInt(m.tier), `route.models ${m.id}: tier must be a positive integer`);
     check(posInt(m.contextWindow), `route.models ${m.id}: contextWindow must be a positive integer`);
-    check(Array.isArray(m.efforts) && m.efforts.every((e) => EFFORTS.includes(e)), `route.models ${m.id}: efforts must list known efforts`);
+    check(Array.isArray(m.efforts) && m.efforts.length > 0 && m.efforts.every((e) => EFFORTS.includes(e)), `route.models ${m.id}: efforts must list known efforts`);
   }
   check(posInt(c.skills.shortlist) && posInt(c.skills.maxSkills) && prob(c.skills.threshold), 'skills: shortlist/maxSkills positive, threshold 0..1');
   check(posInt(c.retrieve.shortlist) && posInt(c.retrieve.budgetTokens) && prob(c.retrieve.threshold), 'retrieve: shortlist/budgetTokens positive, threshold 0..1');
@@ -104,6 +104,7 @@ export function validateConfig(c) {
   const k = c.compress;
   check(prob(k.softRatio) && prob(k.hardRatio) && prob(k.targetRatio) && k.targetRatio <= k.softRatio && k.softRatio <= k.hardRatio, 'compress: need targetRatio <= softRatio <= hardRatio, all 0..1');
   check(Number.isInteger(k.keepRecentTurns) && k.keepRecentTurns >= 0, 'compress.keepRecentTurns must be >= 0');
+  check(posInt(k.maxSegmentsAsked) && posInt(k.excerptChars) && posInt(k.summaryChars), 'compress: maxSegmentsAsked, excerptChars and summaryChars must be positive integers');
   check(Number.isInteger(c.server.port) && c.server.port >= 0 && c.server.port < 65536, 'server.port must be 0..65535');
 }
 
