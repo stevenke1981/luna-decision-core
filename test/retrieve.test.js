@@ -92,6 +92,22 @@ test('normalize resolves root to an absolute path, and a root inside an allowed 
   assert.equal(normalize({ query: 'where is it' }, cfg).root, undefined, 'no root, none resolved');
 }));
 
+test('prepare resolves an existing parent alias when the requested child is missing', () => withDir(async (dir) => {
+  const target = path.join(dir, 'target');
+  const alias = path.join(dir, 'alias');
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const cfg = cfgFor(dir, { allowedRoots: [alias] });
+  const input = normalize({ query: 'cache eviction', root: path.join(alias, 'missing', 'repo') }, cfg);
+  let calls = 0;
+  const found = await prepare(input, cfg, { repoIndex: () => {
+    calls++;
+    return { search: () => [] };
+  } });
+  assert.deepEqual(found.candidates, []);
+  assert.equal(calls, 1);
+}));
+
 test('normalize rejects a root outside retrieve.allowedRoots, including "..", a sibling with the same prefix, and a drive root', () => withDir(async (dir) => {
   const cfg = cfgFor(dir, { allowedRoots: [dir] });
   const outside = [

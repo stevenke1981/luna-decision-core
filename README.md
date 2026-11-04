@@ -6,7 +6,7 @@ One decision layer for coding-agent harnesses. OpenAI's Luna (`gpt-6-luna`, Deci
 
 > 與 `luna-decision-openai`（Codex 用的本機 proxy）不同。本 repo 是可被 harness 呼叫的函式庫、CLI、HTTP sidecar 與 MCP server。
 
-> **驗證狀態（2026-11-05）**：Windows 上 Node 22.15.0 與 24.20.0 各通過 391 個測試；實際 CLI、HTTP 與 MCP stdio 程序已完成離線驗收。完整範圍與未執行項目見 [驗收紀錄](docs/team/v1/acceptance.md)。範例中的耗時與模型機率僅供示意。
+> **驗證狀態（2026-11-05）**：Windows 上 Node 22.15.0 與 24.20.0 各通過 392 個測試；實際 CLI、HTTP 與 MCP stdio 程序已完成離線驗收。完整範圍與未執行項目見 [驗收紀錄](docs/team/v1/acceptance.md)。範例中的耗時與模型機率僅供示意。
 
 Node.js ≥ 22.15，ESM，**零依賴**（`package.json` 沒有 dependencies，不需要 `npm install`）。
 

@@ -129,8 +129,11 @@ function realOrSelf(p) {
   try {
     return fs.realpathSync.native(p);
   } catch (err) {
-    if (err.code === 'ENOENT') return p;
-    throw err;
+    if (err.code !== 'ENOENT') throw err;
+    // Resolve the existing ancestor as well: a missing child still carries its parent's
+    // junction or Windows 8.3 alias, while an existing allowed base is already canonical.
+    const parent = path.dirname(p);
+    return parent === p ? p : path.join(realOrSelf(parent), path.basename(p));
   }
 }
 
