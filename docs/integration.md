@@ -114,6 +114,8 @@ curl -s http://127.0.0.1:8792/health
 
 sidecar 是單一程序。**沒有身分驗證**，保持綁定 loopback（`server.host` 預設 `127.0.0.1`），不要對外開放。
 
+HTTP 呼叫端必須送出 `Content-Type: application/json`。服務拒絕所有帶有 `Origin` 標頭的請求（403），供 CLI、MCP 與伺服器端 harness 使用。`server.host` 只能由家目錄或明確指定的設定檔變更。
+
 ### 3.2 端點
 
 | 方法與路徑 | 用途 |
@@ -184,9 +186,12 @@ console.log(route.result.model, route.result.effort, route.source);
 |---|---|---|
 | `200` | 成功。在 `auto` 模式下，Luna 出錯時仍回 200，並以規則結果回傳，`error` 欄位說明原因 | 讀取 `error`，記錄為降級 |
 | `400` | JSON 格式錯誤，或輸入不合法（`TypeError`） | 修正請求，不要重試同一筆 |
+| `403` | 請求帶有瀏覽器 `Origin` 標頭 | 從伺服器端 harness 呼叫服務 |
 | `404` | 未知路徑（例如未知 kind） | 修正路徑 |
+| `413` | 請求本體超過 1 MB | 縮小輸入 |
+| `415` | Content-Type 不是 `application/json` | 設定 JSON content type |
 | `502` | 嚴格（`luna`）模式下 Luna 出錯 | 改用本機規則或 harness 的預設值 |
-| `500` | 其他錯誤 | 記錄後使用 harness 的預設值 |
+| `500` | 本機 IO 等其他錯誤（strict 模式也適用） | 記錄後使用 harness 的預設值 |
 
 sidecar 無法連線時，harness 應使用自己的預設值繼續執行，不要因此中止任務。
 

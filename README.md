@@ -6,7 +6,7 @@ One decision layer for coding-agent harnesses. OpenAI's Luna (`gpt-6-luna`, Deci
 
 > 與 `luna-decision-openai`（Codex 用的本機 proxy）不同。本 repo 是可被 harness 呼叫的函式庫、CLI、HTTP sidecar 與 MCP server。
 
-> **文件狀態（v0.1.0）**：依 `docs/design.md` 撰寫。CLI、HTTP、MCP 的範例輸出標為「示意」，表示尚未對建置完成的 `bin/luna-core.js` 實機執行。函式庫範例的輸出是以 heuristic 模式實測的。
+> **驗證狀態（2026-11-05）**：Windows 上 Node 22.15.0 與 24.20.0 各通過 391 個測試；實際 CLI、HTTP 與 MCP stdio 程序已完成離線驗收。完整範圍與未執行項目見 [驗收紀錄](docs/team/v1/acceptance.md)。範例中的耗時與模型機率僅供示意。
 
 Node.js ≥ 22.15，ESM，**零依賴**（`package.json` 沒有 dependencies，不需要 `npm install`）。
 
@@ -114,13 +114,17 @@ Library 呼叫 `engine.decide(kind, input)` 時，kind 名稱為 `route`、`skil
 
 注意：redaction 是樣式比對，不是保證。它涵蓋 PEM 私鑰區塊、`sk-`、`sk-or-`、`gh[pousr]_`、`github_pat_`、`glpat-`、`xox[abpr]-`、`AKIA`、`AIza`、Bearer token 與 JWT、`scheme://user:pass@` 形式的網址帳密，以及 `password`、`secret`、`token`、`api_key`、`access_key`、`client_secret`、`auth` 等鍵名（含 `DB_PASSWORD`、`"apiKey"` 這類前綴與引號寫法）後接 `:` 或 `=` 的指派。不要把秘密放進任務、查詢或觀察內容。
 
-**設定檔的信任分層**：`luna.url`、`memory.path`、`ledger.path`、`skills.dirs`、`retrieve.allowedRoots` 只接受來自 `--config`／`LUNA_CORE_CONFIG` 指定的檔案或家目錄設定（`<home>/config.json`）；寫在工作資料夾的 `luna-core.config.json` 會直接報錯，避免陌生專案把金鑰導向別處或讀取任意資料夾。`luna.url`（含 `LUNA_DECISION_URL`）必須是 `https:`，或指向 `127.0.0.1`／`localhost`。Luna 回傳的錯誤訊息中，金鑰原文會換成 `[key]`。
+**設定檔的信任分層**：`luna.url`、`memory.path`、`ledger.path`、`skills.dirs`、`retrieve.allowedRoots`、`server.host` 只接受來自 `--config`／`LUNA_CORE_CONFIG` 指定的檔案或家目錄設定（`<home>/config.json`）；寫在工作資料夾的 `luna-core.config.json` 會直接報錯，避免陌生專案把金鑰導向別處、讀取任意資料夾或改變服務的網路範圍。`luna.url`（含 `LUNA_DECISION_URL`）必須是 `https:`，或指向 `127.0.0.1`／`localhost`。Luna 回傳的錯誤訊息中，金鑰原文會換成 `[key]`。
 
 ## 3. 快速開始
 
 Heuristic 模式不需要金鑰，可以先跑通。
 
 ```powershell
+# Get the public repository first, if needed:
+git clone https://github.com/stevenke1981/luna-decision-core.git
+cd luna-decision-core
+
 # Windows PowerShell, in D:\luna-decision-core (the repository folder)
 npm link                                    # once: registers the luna-core command
 luna-core --version
@@ -142,9 +146,9 @@ luna-core probe
 LUNA_CORE_MODE=heuristic luna-core route --task "rename a variable in one file"
 ```
 
-`probe` 會實際呼叫一次 `gpt-6-luna`，印出決策、費用與 token 數。沒有金鑰時應報錯並以 exit 1 結束（依 `docs/design.md` §6；尚未實測）。
+`probe` 會實際呼叫一次 `gpt-6-luna`，印出決策、費用與 token 數。沒有金鑰時會報錯並以 exit 1 結束（已用實際 CLI 程序驗證）。本次驗收環境沒有可用金鑰，未重跑付費 API 呼叫。
 
-示意輸出（形狀與第 2 節相同；未實機執行 CLI）：
+示意輸出（CLI 已驗證此形狀，耗時每次不同）：
 
 ```json
 { "kind": "route", "source": "rules", "result": { "model": "claude-haiku-5-5", "effort": "medium", "fallbackChain": ["claude-sonnet-5-5", "claude-opus-5-5"], "modelProbabilities": null, "effortProbabilities": null }, "confidence": null, "reasons": ["routine task", "model claude-haiku-5-5"], "cost": null, "tokens": null, "calls": 0, "latencyMs": 0 }
@@ -195,7 +199,7 @@ CLI 啟動時會先讀取 env 檔。輸出為 JSON 寫到 stdout；錯誤寫到 
 | `luna-core config` | 印出有效設定（不含金鑰） | — |
 | 全域旗標 | `--mode auto\|luna\|heuristic`、`--config FILE`、`--version`、`--help` | — |
 
-示例（示意，未實機執行）：
+CLI 範例：
 
 ```bash
 luna-core skills --task "Use /rust-testing to add unit tests" --dir ./skills
@@ -215,9 +219,11 @@ HTTP sidecar 是單一 Node 程序，預設綁定 `127.0.0.1:8792`（`server.hos
 | `POST /v1/decide/:kind` | 請求本體為該 kind 的輸入 JSON（欄位與第 8 節相同）；回傳 Decision。`:kind` 為 `route`、`skills`、`retrieve`、`memory_recall`、`memory_write`、`compress` 之一 |
 | `GET /v1/stats` | 回傳 `engine.stats()` 的副本 |
 
-錯誤狀態碼：`400` 為 JSON 格式錯誤或 `TypeError`；`404` 為未知路徑；`502` 為嚴格模式下 Luna 出錯；`500` 為其他錯誤。請求本體上限 1 MB（超過時的狀態碼請以實作為準）。
+決策請求必須帶 `Content-Type: application/json`（可加 `charset`）。服務供 CLI 與 harness 使用，拒絕所有帶有 `Origin` 標頭的瀏覽器請求，避免跨來源網頁寫入記憶或消耗 Luna 額度。
 
-示意（示意，未實機執行）：
+錯誤狀態碼：`400` 為 JSON 格式錯誤或輸入不合法；`403` 為帶有 `Origin` 的請求；`404` 為未知路徑；`413` 為本體超過 1 MB；`415` 為非 JSON content type；`502` 為嚴格模式下 Luna 出錯；`500` 為本機 IO 等其他錯誤（strict 模式也一樣）。
+
+HTTP 範例：
 
 ```bash
 curl -s http://127.0.0.1:8792/health

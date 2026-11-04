@@ -15,7 +15,7 @@ import { homeDir } from './envfile.js';
 export const CONFIG_FILE = 'luna-core.config.json';
 // Below this a summary is mostly its `[summarized N→M tokens]` marker.
 const MIN_SUMMARY_CHARS = 64;
-const TRUSTED_ONLY_KEYS = [['luna', 'url'], ['memory', 'path'], ['ledger', 'path'], ['skills', 'dirs'], ['retrieve', 'allowedRoots']];
+const TRUSTED_ONLY_KEYS = [['luna', 'url'], ['memory', 'path'], ['ledger', 'path'], ['skills', 'dirs'], ['retrieve', 'allowedRoots'], ['server', 'host']];
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
 

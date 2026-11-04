@@ -21,6 +21,12 @@ const BUCKET_OF_SOURCE = Object.freeze({ settled: 'settled', rules: 'rules', lun
 const DEP_KEYS = Object.freeze(['store', 'loadCatalog', 'repoIndex']);
 const NO_SPEND = Object.freeze({ calls: 0, cost: null, tokens: null });
 const EMPTY_KIND_STATS = Object.freeze({ decisions: 0, luna: 0, rules: 0, settled: 0, fallbacks: 0 });
+const lunaFailures = new WeakSet();
+
+/** Recognizes strict Luna failures without changing the error rethrown to library callers. */
+export function isLunaFailure(error) {
+  return lunaFailures.has(error);
+}
 
 /** Memoizes an async loader; a failed load is forgotten, so the next call retries it. */
 function once(load) {
@@ -258,6 +264,7 @@ export function createEngine({ config, transport = postDecision, kinds, deps, le
     if (step.error) stats = countError(stats);
     if (step.error && config.mode === MODE_STRICT) {
       log.append(failureDecision(kind, step, elapsedSince(t0)));
+      lunaFailures.add(step.error);
       throw step.error;
     }
     if (!Object.hasOwn(BUCKET_OF_SOURCE, step.source)) throw new Error(`${kind}: invalid source "${step.source}"`);

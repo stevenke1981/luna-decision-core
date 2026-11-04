@@ -1,10 +1,12 @@
 // The HTTP JSON sidecar (docs/design.md §6): `GET /health`, `POST /v1/decide/:kind` and
 // `GET /v1/stats`, bound to loopback by default. Status codes: 200 ok; 400 a body that is not JSON
 // or an input the kind's normalize rejects; 404 an unknown route or kind; 413 a body over
-// BODY_LIMIT_BYTES; 502 a Luna failure in strict (`luna`) mode; 500 anything else. Every message
+// BODY_LIMIT_BYTES; 403 a browser Origin; 415 a non-JSON content type; 502 a strict Luna failure;
+// 500 anything else. Every message
 // goes through scrubSecrets, so the API key never reaches a response or the log.
 import http from 'node:http';
 import { scrub } from '../contract.js';
+import { isLunaFailure } from '../engine.js';
 import { KINDS } from '../defaults.js';
 import { KIND_MODULES } from '../registry.js';
 import { VERSION } from '../version.js';
@@ -13,8 +15,7 @@ import { VERSION } from '../version.js';
 export const BODY_LIMIT_BYTES = 1024 * 1024;
 const JSON_TYPE = 'application/json';
 const DECIDE_PATH = /^\/v1\/decide\/([^/]+)$/;
-const MODE_STRICT = 'luna';
-const STATUS = Object.freeze({ OK: 200, BAD_INPUT: 400, NOT_FOUND: 404, TOO_LARGE: 413, UPSTREAM: 502, SERVER: 500 });
+const STATUS = Object.freeze({ OK: 200, BAD_INPUT: 400, FORBIDDEN: 403, NOT_FOUND: 404, TOO_LARGE: 413, MEDIA_TYPE: 415, UPSTREAM: 502, SERVER: 500 });
 
 const writeStderr = (line) => process.stderr.write(line);
 
@@ -74,7 +75,7 @@ function decodeKind(raw) {
 
 /** A failed decision: 502 in strict mode (a Luna failure), 500 otherwise. Logged, then answered. */
 function failDecision(res, ctx, kind, err) {
-  const status = ctx.config.mode === MODE_STRICT ? STATUS.UPSTREAM : STATUS.SERVER;
+  const status = isLunaFailure(err) ? STATUS.UPSTREAM : STATUS.SERVER;
   ctx.log(`luna-core: ${kind}: ${scrubSecrets(err?.message ?? err, ctx.secrets)}\n`);
   sendError(res, ctx, status, err?.message ?? err);
 }
@@ -105,6 +106,10 @@ async function parseDecideBody(req, res, ctx, kind) {
 async function decide(req, res, ctx, rawKind) {
   const kind = decodeKind(rawKind);
   if (kind === null) return sendError(res, ctx, STATUS.NOT_FOUND, 'unknown kind');
+  if (req.headers['content-type']?.split(';')[0].trim().toLowerCase() !== JSON_TYPE) {
+    req.resume();
+    return sendError(res, ctx, STATUS.MEDIA_TYPE, 'content-type must be application/json');
+  }
   const parsed = await parseDecideBody(req, res, ctx, kind);
   if (!parsed) return undefined;
   try {
@@ -115,6 +120,12 @@ async function decide(req, res, ctx, rawKind) {
 }
 
 async function handle(req, res, ctx) {
+  // This sidecar serves nonbrowser clients. Browser writes must be blocked before any work,
+  // since missing CORS headers alone do not prevent a simple request from changing memory.
+  if (req.headers.origin !== undefined) {
+    req.resume();
+    return sendError(res, ctx, STATUS.FORBIDDEN, 'browser-origin requests are not supported');
+  }
   const pathname = (req.url ?? '/').split('?')[0];
   if (req.method === 'GET' && pathname === '/health') {
     return send(res, STATUS.OK, { ok: true, version: VERSION, mode: ctx.config.mode });

@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "One decision layer for coding agents: OpenAI's Luna (Decisions API) picks the model and effort, the skills to load, what to retrieve, what to remember and what to compress; local rules gate every answer and take over when Luna is unavailable.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stevenke1981/luna-decision-core.git"
+  },
+  "homepage": "https://github.com/stevenke1981/luna-decision-core#readme",
+  "bugs": {
+    "url": "https://github.com/stevenke1981/luna-decision-core/issues"
+  },
   "bin": {
     "luna-core": "bin/luna-core.js"
   },

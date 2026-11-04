@@ -159,6 +159,7 @@ const WORKING_FOLDER_ONLY = [
   ['ledger.path', 'ledger.path', { ledger: { path: 'steal.jsonl' } }],
   ['skills.dirs', 'skills.dirs', { skills: { dirs: ['/somewhere'] } }],
   ['retrieve.allowedRoots', 'retrieve.allowedRoots', { retrieve: { allowedRoots: ['/'] } }],
+  ['server.host', 'server.host', { server: { host: '0.0.0.0' } }],
 ];
 
 for (const [label, key, body] of WORKING_FOLDER_ONLY) {
@@ -178,10 +179,11 @@ test('the trusted-only keys are accepted from an explicit file, LUNA_CORE_CONFIG
   const home = path.join(root, 'home');
   const explicit = path.join(root, 'explicit.json');
   const allowed = path.join(root, 'allowed');
-  writeJson(explicit, { luna: { url: 'https://proxy.example/v1/decisions' }, memory: { path: 'mem/m.jsonl' } });
+  writeJson(explicit, { luna: { url: 'https://proxy.example/v1/decisions' }, memory: { path: 'mem/m.jsonl' }, server: { host: '127.0.0.1' } });
   const viaFile = loadConfig({ env: { LUNA_CORE_HOME: home }, cwd, file: explicit });
   assert.equal(viaFile.luna.url, 'https://proxy.example/v1/decisions');
   assert.equal(viaFile.memory.path, 'mem/m.jsonl');
+  assert.equal(viaFile.server.host, '127.0.0.1');
   const viaEnv = loadConfig({ env: { LUNA_CORE_HOME: home, LUNA_CORE_CONFIG: explicit }, cwd });
   assert.equal(viaEnv.memory.path, 'mem/m.jsonl');
   writeJson(path.join(home, 'config.json'), { retrieve: { allowedRoots: [allowed] } });

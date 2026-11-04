@@ -191,8 +191,10 @@ Windows EPERM/EBUSY/EACCES) and run under an O_EXCL lock file `<file>.lock` (wai
 lock older than 10 s is stale and removed); they create the folder, append lines skipped on load
 to `<file>.rejected` (no raw text for secret lines), and **refuse** a text matching `SECRET`. Reads the file on each call (no stale cache).
 
-`memory_recall` input `{ query, limit? }`; prepare: `memories = deps.store.search(query,
-cfg.memory.shortlist)`. None → settled `{memories: [], considered: 0}`. State `{ query, memories:
+`memory_recall` input `{ query, limit? }`; prepare: search by BM25, then top up to
+`cfg.memory.shortlist` with the most recently updated other memories (score 0) so Luna can
+recognize paraphrases. Heuristic recall keeps only positive lexical matches. None → settled
+`{memories: [], considered: 0}`. State `{ query, memories:
 [{id: m<i>, type, text: excerpt 400}] }`; predicate per memory. Result `{ memories: [{id, type,
 text, probability|null}], considered }`, p ≥ recallThreshold by p desc, capped at limit ??
 maxRecall. Heuristic: BM25 score ≥ 0.5 × top, capped.
@@ -279,8 +281,10 @@ JSON), `serve [--port N]`, `mcp`, `config` (effective config without the key), `
 `--config`, `--version`, `--help`. Loads env files first.
 
 HTTP: `GET /health` → `{ok, version, mode}`; `POST /v1/decide/:kind` JSON body → Decision; `GET
-/v1/stats`. Binds 127.0.0.1 by default; body limit 1 MB; 400 on bad JSON/TypeError, 404 unknown
-route, 502 on a strict-mode Luna error, 500 otherwise.
+/v1/stats`. Binds 127.0.0.1 by default; rejects any `Origin` header with 403 before dispatch.
+Decision requests require `Content-Type: application/json` (charset parameters accepted),
+otherwise 415. Body limit 1 MB (413); 400 on bad JSON/invalid input, 404 unknown route,
+502 on a strict-mode Luna error, 500 on local IO/other failures in every mode.
 
 MCP (stdio, JSON-RPC 2.0, newline-delimited, protocol `2025-06-18`): `initialize`,
 `notifications/initialized`, `tools/list`, `tools/call`, `ping`. Tools `luna_route`,
@@ -292,7 +296,7 @@ schemas (`additionalProperties: false`). Result `content: [{type: 'text', text: 
 
 - The API key only from env; never logged, never in config output, never in the ledger. It is
   a non-enumerable config property; Luna error bodies have it replaced by `[key]` (`scrub`).
-- Config trust: `luna.url`, `memory.path`, `ledger.path`, `skills.dirs`, `retrieve.allowedRoots`
+- Config trust: `luna.url`, `memory.path`, `ledger.path`, `skills.dirs`, `retrieve.allowedRoots`, `server.host`
   are accepted only from an explicit config file, `LUNA_CORE_CONFIG` or the home config, never
   from a working-folder `luna-core.config.json`. `luna.url` must be https or loopback.
 - Memory refuses secrets (contract `SECRET`) both in Luna state and on disk.
