@@ -73,7 +73,8 @@ See `src/contract.js` (normative). Every kind module exports one frozen object w
 - Pure except `prepare`/`finalize`, which do IO only through `deps`.
 - Never mutate inputs; return new objects.
 - Question names: `[a-z][a-z0-9_]*`, indexed ids via `indexId(prefix, i)`.
-- State never contains secrets; long texts are cut with `excerpt()`.
+- State never contains secrets; long texts are cut with `excerpt()`. The engine also applies
+  `redactDeep` (contract) to every state before it is sent, as a second line of defence.
 - `interpret` throws on malformed answers (via `src/luna/answers.js`), never guesses.
 - `heuristic` and `interpret` return the **same result shape**.
 - Named constants for every threshold not in `defaults.js` (no magic numbers).
@@ -130,8 +131,9 @@ front matter between `---` lines: `name:` and `description:` (plain, single- or 
 or a `>`/`|` block of indented lines). Missing name → folder name. Missing dir → skipped. Sorted by
 name; duplicates by name keep the first dir's.
 
-Plan: forced = skills referenced in the task as `/name` or whole-word `name` (case-insensitive,
-name ≥ 4 chars). Shortlist = `createBm25(name + description)` top `cfg.skills.shortlist`,
+Plan: forced = skills referenced in the task as a `/name` command (at the start or after
+whitespace/an opening quote), or by a distinctive name (containing `-` or `:`) as a whole word;
+case-insensitive, name ≥ 4 chars. A plain word such as `testing` written in prose is left to Luna. Shortlist = `createBm25(name + description)` top `cfg.skills.shortlist`,
 excluding forced. Empty shortlist → settled. State `{ task: excerpt 2000, skills: [{id: s<i>,
 name, description: excerpt 300}] }`; predicate `s<i>`: `Should skill s<i> ("name") be loaded for
 this task?`.
