@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -18,3 +21,13 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: node --test "test/**/*.test.js"
+      - name: Archive the tested source
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        run: git archive --format=zip --output=source.zip HEAD
+      - name: Retain the tested source
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-source
+          path: source.zip
+          retention-days: 7
