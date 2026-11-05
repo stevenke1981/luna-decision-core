@@ -15,7 +15,8 @@
     "luna-core": "bin/luna-core.js"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "examples:capability": "node examples/capability/seven-principles.mjs"
   },
   "engines": {
     "node": ">=22.15"

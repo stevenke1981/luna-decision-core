@@ -1,0 +1,46 @@
+{
+  "task": "Improve Crew focus handling without interrupting typing.",
+  "control": {
+    "taskId": "crew-focus",
+    "revision": "fixture-v1",
+    "goal": "Add opt-in focus following without interrupting typing.",
+    "acceptance": [
+      "focus-tests",
+      "manual-typing-check"
+    ],
+    "constraints": [
+      "Keep focus following off by default.",
+      "Preserve manual focus control."
+    ],
+    "current": {
+      "model": "worker-demo",
+      "effort": "medium"
+    },
+    "attempts": [
+      {
+        "id": "attempt-1",
+        "taskId": "crew-focus",
+        "model": "worker-demo",
+        "effort": "medium",
+        "outcome": "fail",
+        "failureKind": "implementation",
+        "source": "test",
+        "evidenceRef": "fixture://test-run-1",
+        "fingerprint": "focus-race",
+        "hypothesis": "hypothesis-1"
+      },
+      {
+        "id": "attempt-2",
+        "taskId": "crew-focus",
+        "model": "worker-demo",
+        "effort": "medium",
+        "outcome": "fail",
+        "failureKind": "implementation",
+        "source": "test",
+        "evidenceRef": "fixture://test-run-2",
+        "fingerprint": "focus-race",
+        "hypothesis": "hypothesis-2"
+      }
+    ]
+  }
+}

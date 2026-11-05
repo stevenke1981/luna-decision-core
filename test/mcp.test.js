@@ -91,7 +91,7 @@ test('tools/list names the six tools, each with a closed input schema that mirro
     }
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.inputSchema]));
     assert.deepEqual(byName.luna_route.required, ['task']);
-    assert.deepEqual(Object.keys(byName.luna_route.properties).sort(), ['candidates', 'contextTokens', 'localOnly', 'requires', 'steps', 'task']);
+    assert.deepEqual(Object.keys(byName.luna_route.properties).sort(), ['candidates', 'contextTokens', 'control', 'localOnly', 'requires', 'steps', 'task']);
     assert.deepEqual(byName.luna_remember.properties.source.enum, ['user', 'agent', 'tool']);
     assert.deepEqual(byName.luna_remember.properties.type.enum, ['user', 'feedback', 'project', 'reference']);
     assert.deepEqual(byName.luna_compress.required, ['window', 'segments']);
@@ -311,3 +311,4 @@ test('a tool error message has the API key scrubbed when the config supplies it'
 test('createMcpServer requires an engine', () => {
   assert.throws(() => createMcpServer({}), /engine is required/);
 });
+

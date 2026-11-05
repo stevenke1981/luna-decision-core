@@ -4,6 +4,7 @@
 // JSON-RPC lines; diagnostics go to `log` (stderr by default). Requests are handled concurrently
 // and each reply carries its request id.
 import readline from 'node:readline';
+import { CONTROL_SCHEMA, FAILURE_KINDS } from '../capability.js';
 import { MEMORY_TYPES } from '../defaults.js';
 import { VERSION } from '../version.js';
 import { scrubSecrets } from './http.js';
@@ -27,6 +28,7 @@ const closed = (properties, required = []) => ({ type: 'object', properties, req
 const STEP = closed({
   kind: { type: 'string', enum: STEP_KINDS, description: 'What the step did.' },
   command: str('The command or action, as text.'),
+  failureKind: { type: 'string', enum: FAILURE_KINDS, description: 'Explicit root cause; non-cognitive failures do not raise effort.' },
   failed: { type: ['boolean', 'null'], description: 'true if it failed, false if it passed, null if still running.' },
 }, ['kind', 'command']);
 const SKILL = closed({
@@ -57,6 +59,7 @@ const TOOLS = Object.freeze([
     kind: 'route',
     description: 'Choose the model and reasoning effort for the next generation of a coding task.',
     inputSchema: closed({
+      control: CONTROL_SCHEMA,
       task: str('The user task.'),
       steps: list('Recent agent steps, oldest first; a failure streak raises the effort.', STEP),
       contextTokens: num('Tokens of context the request carries; the model window must fit it.', 0),

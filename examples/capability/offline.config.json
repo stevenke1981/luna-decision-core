@@ -1,0 +1,39 @@
+{
+  "mode": "heuristic",
+  "ledger": {
+    "enabled": false
+  },
+  "route": {
+    "models": [
+      {
+        "id": "worker-demo",
+        "tier": 1,
+        "contextWindow": 200000,
+        "capabilities": [
+          "tools"
+        ],
+        "local": true,
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "strengths": "offline fixture, not a provider model"
+      },
+      {
+        "id": "expert-demo",
+        "tier": 2,
+        "contextWindow": 200000,
+        "capabilities": [
+          "tools"
+        ],
+        "local": true,
+        "efforts": [
+          "low",
+          "high"
+        ],
+        "strengths": "offline fixture, not a provider model"
+      }
+    ]
+  }
+}

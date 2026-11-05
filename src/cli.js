@@ -73,7 +73,7 @@ const flag = { type: 'boolean' };
 const COMMON_OPTIONS = { mode: str, config: str, help: { type: 'boolean', short: 'h' }, version: flag };
 const DECISION_OPTIONS = { input: str, format: str };
 const INPUT_FIELDS = Object.freeze({
-  route: ['task', 'steps', 'contextTokens', 'requires', 'localOnly', 'candidates'],
+  route: ['task', 'steps', 'contextTokens', 'requires', 'localOnly', 'candidates', 'control'],
   skills: ['task', 'catalog', 'dirs', 'maxSkills'],
   retrieve: ['query', 'root', 'candidates', 'budgetTokens', 'force'],
   memory_recall: ['query', 'limit'],
