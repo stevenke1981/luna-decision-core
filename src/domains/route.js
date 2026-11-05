@@ -4,6 +4,7 @@
 // Luna's answer so that a failing agent never gets less than the rules give it.
 import { DEEP_QUESTION, GREETING, HARD_TASK, redact, requireText, verdict } from '../contract.js';
 import { EFFORTS } from '../defaults.js';
+import { FAILURE_KINDS, cognitiveFailure, normalizeControl, capabilityDecision } from '../capability.js';
 import { choiceAnswer, quantileIndex, scoreConfidence, scoreLevel } from '../luna/answers.js';
 import { excerpt } from '../text.js';
 
@@ -47,7 +48,11 @@ function normalizeStep(step, i) {
   if (typeof step.command !== 'string') throw new TypeError(`${at}.command must be a string`);
   const failed = step.failed ?? null;
   if (failed !== null && typeof failed !== 'boolean') throw new TypeError(`${at}.failed must be true, false or null`);
-  return { kind: step.kind, command: step.command, failed };
+  if (step.failureKind !== undefined && !FAILURE_KINDS.includes(step.failureKind)) {
+    throw new TypeError(`${at}.failureKind is unsupported`);
+  }
+  return { kind: step.kind, command: step.command, failed,
+    ...(step.failureKind !== undefined ? { failureKind: step.failureKind } : {}) };
 }
 
 function normalizeSteps(steps) {
@@ -134,20 +139,25 @@ function normalize(input, cfg) {
     requires: input.requires == null ? [] : normalizeList(input.requires, 'requires'),
     localOnly: normalizeFlag(input.localOnly),
     candidates: input.candidates == null ? null : normalizeList(input.candidates, 'candidates'),
+    ...(input.control !== undefined ? { control: normalizeControl(input.control) } : {}),
   };
   eligibleOrThrow(normalized, cfg);
   return normalized;
 }
 
+const countsFailure = (s) => s.failed === true && (s.failureKind === undefined || cognitiveFailure(s.failureKind));
+
 function failureStreak(steps) {
   let n = 0;
-  for (let i = steps.length - 1; i >= 0 && steps[i].failed === true; i--) n++;
+  for (let i = steps.length - 1; i >= 0 && countsFailure(steps[i]); i--) n++;
   return n;
 }
 
 // The same failing command (whitespace squashed) at least twice in the last REPEAT_WINDOW steps.
 function repeatsFailure(steps) {
-  const failed = steps.slice(-REPEAT_WINDOW).filter((s) => s.failed === true).map((s) => squash(s.command));
+  const last = steps.at(-1);
+  if (last?.failed && last.failureKind !== undefined && !cognitiveFailure(last.failureKind)) return false;
+  const failed = steps.slice(-REPEAT_WINDOW).filter(countsFailure).map((s) => squash(s.command));
   return new Set(failed).size < failed.length;
 }
 
@@ -156,6 +166,7 @@ function recentSteps(steps) {
     kind: s.kind,
     command: excerpt(redact(s.command), MAX_COMMAND_CHARS),
     status: statusOf(s.failed),
+    ...(s.failureKind !== undefined ? { failureKind: s.failureKind } : {}),
   }));
 }
 
@@ -179,6 +190,11 @@ function effortQuestion(ladder) {
 
 /** The state and questions for Luna; the eligible models are kept in `ctx` for interpret. */
 function plan(input, cfg) {
+  if (input.control) {
+    const controlled = heuristic(input, cfg);
+    // A remediation, completion, or an already running stage needs no paid routing call.
+    if (input.control.current || !controlled.result.control.canExecute) return { settled: controlled };
+  }
   const eligible = eligibleOrThrow(input, cfg);
   return {
     state: {
@@ -186,6 +202,10 @@ function plan(input, cfg) {
       recent_steps: recentSteps(input.steps),
       failures_in_a_row: failureStreak(input.steps),
       context_tokens: input.contextTokens,
+      ...(input.control ? { outcome: {
+        goal: input.control.goal, constraints: input.control.constraints,
+        acceptance: input.control.acceptance,
+      } } : {}),
       models: eligible.map((m) => ({ id: m.id, tier: m.tier, strengths: m.strengths })),
     },
     questions: [...(eligible.length > 1 ? [modelQuestion(eligible)] : []), effortQuestion(cfg.ladder)],
@@ -285,13 +305,13 @@ function modelAtLevel(eligible, level) {
 /** The rules' answer, for when Luna is unavailable or abstains. Same shape as interpret. */
 function heuristic(input, cfg) {
   const eligible = eligibleOrThrow(input, cfg);
-  const { level, reason } = difficulty(input, cfg);
+  const { level, reason } = difficulty(input.control ? { ...input, steps: [] } : input, cfg);
   const model = modelAtLevel(eligible, level);
   const asked = cfg.ladder[level];
   const effort = clampEffort(asked, model.efforts);
   const reasons = [reason, `model ${model.id}`];
   if (effort !== asked) reasons.push(`effort ${asked} clamped to ${effort} for ${model.id}`);
-  return verdict(resultFor(eligible, model, effort, {}), null, reasons);
+  return withControl(verdict(resultFor(eligible, model, effort, {}), null, reasons), input, cfg);
 }
 
 function findModel(eligible, id) {
@@ -308,6 +328,7 @@ const higherEffort = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a)
  * the result changed.
  */
 function gate(luna, rules, input, cfg) {
+  if (input.control) return withControl(luna, input, cfg);
   const streak = failureStreak(input.steps);
   if (streak < 1) return luna;
   const eligible = eligibleOrThrow(input, cfg);
@@ -320,9 +341,19 @@ function gate(luna, rules, input, cfg) {
   return verdict(resultFor(eligible, model, effort, luna.result), luna.confidence, reasons, 'luna+rules');
 }
 
+function withControl(answer, input, cfg) {
+  if (!input.control) return answer;
+  const eligible = eligibleOrThrow(input, cfg);
+  const control = capabilityDecision(input.control, answer.result, eligible);
+  const model = findModel(eligible, control.model);
+  const changed = model.id !== answer.result.model || control.effort !== answer.result.effort;
+  return verdict({ ...resultFor(eligible, model, control.effort, answer.result), control },
+    answer.confidence, [...answer.reasons, control.reason], changed ? 'luna+rules' : answer.source);
+}
+
 /** One short line for the ledger and the CLI; never the task text. */
 function summarize(result) {
-  return `${result.model} effort=${result.effort}`;
+  return `${result.model} effort=${result.effort}${result.control ? ` next=${result.control.nextAction}` : ''}`;
 }
 
 /** The `route` kind module (contract: src/contract.js). */
