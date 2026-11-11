@@ -1,106 +1,111 @@
-// Parsing of Decisions API answers. Every domain reads Luna's answers through these helpers,
-// so a malformed or refused answer fails the same way everywhere (it throws, and the engine
-// falls back to the rules in `auto` mode).
+// Decode and validate the answer shapes shared by the decision domains.
+import { DecisionError } from '../errors.js';
+
+const malformed = (message) => new DecisionError('LUNA_MALFORMED_ANSWER', message);
+const probability = (value) => Number.isFinite(value) && value >= 0 && value <= 1;
 
 /** Answers keyed by question name. */
 export function answersByName(body) {
-  const answers = Array.isArray(body?.answers) ? body.answers : [];
-  const out = {};
-  for (const a of answers) {
-    if (a && typeof a.name === 'string') out[a.name] = a;
+  const answers = body?.answers ?? [];
+  if (!Array.isArray(answers)) throw malformed('Luna response has no answers array');
+  const names = new Set();
+  for (const answer of answers) {
+    const name = answer?.name;
+    if (typeof name !== 'string' || !name || names.has(name)) {
+      throw malformed('Luna returned an invalid or duplicate answer name');
+    }
+    names.add(name);
   }
-  return out;
+  return Object.fromEntries(answers.map((answer) => [answer.name, answer]));
 }
 
-/** The answer named `name`, checked to be of `type`; a refusal or a missing answer throws. */
+/** The answer named `name`, checked to be of `type`. */
 export function expectAnswer(answers, name, type) {
   const answer = answers?.[name];
-  if (answer?.type === 'refusal') throw new Error(`Luna refused "${name}"`);
-  if (answer?.type !== type) throw new Error(`Luna returned no ${type} answer for "${name}"`);
+  if (answer?.type === 'refusal') throw new DecisionError('LUNA_REFUSED', `Luna refused "${name}"`);
+  if (answer?.type !== type) throw malformed(`Luna returned no ${type} answer for "${name}"`);
   return answer;
 }
 
-/** P(yes) of a predicate answer. */
 export function predicateProbability(answers, name) {
   const p = expectAnswer(answers, name, 'predicate').probability;
-  if (!Number.isFinite(p) || p < 0 || p > 1) throw new Error(`Luna returned no probability for "${name}"`);
+  if (!probability(p)) throw malformed(`Luna returned no probability for "${name}"`);
   return p;
 }
 
-// A level's entry in a probability list: matched by value (index) or label when the entries
-// carry them, so the order of the list does not matter; by position otherwise.
-function listEntry(list, label, i) {
-  if (list.some((e) => e && typeof e === 'object' && ('value' in e || 'label' in e))) {
-    return list.find((e) => e?.value === i || e?.label === label);
+function reportedConfidence(answer) {
+  if (!Object.hasOwn(answer, 'confidence')) return null;
+  if (!probability(answer.confidence)) throw malformed(`Luna returned invalid confidence for "${answer.name}"`);
+  return answer.confidence;
+}
+
+function probabilityIndex(entry, index, labels, score) {
+  if (!entry || typeof entry !== 'object') return score ? index : -1;
+  const valueIndex = score ? entry.value : labels.indexOf(entry.value);
+  const labelIndex = score && entry.label !== undefined ? labels.indexOf(entry.label) : undefined;
+  if (labelIndex !== undefined && (labelIndex < 0 || (valueIndex !== undefined && valueIndex !== labelIndex))) return -1;
+  return valueIndex ?? labelIndex ?? (score ? index : -1);
+}
+
+function distribution(answer, labels, score) {
+  if (!Object.hasOwn(answer, 'probabilities')) return null;
+  const p = answer.probabilities;
+  const invalid = () => malformed(`Luna returned invalid probabilities for "${answer.name}"`);
+  if (!p || typeof p !== 'object') throw invalid();
+  const entries = Array.isArray(p)
+    ? p.map((entry, i) => [probabilityIndex(entry, i, labels, score), entry])
+    : Object.entries(p).map(([key, entry]) => [
+      score && !labels.includes(key) && /^\d+$/.test(key) ? Number(key) : labels.indexOf(key), entry,
+    ]);
+  const seen = new Set();
+  const values = labels.map(() => 0);
+  for (const [index, entry] of entries) {
+    const value = entry && typeof entry === 'object' ? entry.probability : entry;
+    if (!Number.isInteger(index) || index < 0 || index >= labels.length || seen.has(index) || !probability(value)) throw invalid();
+    seen.add(index);
+    values[index] = value;
   }
-  return list[i];
+  const sum = values.reduce((total, value) => total + value, 0);
+  if (sum <= 0) throw invalid();
+  return values.map((value) => value / sum);
 }
 
-function normalize(nums) {
-  const clean = nums.map((v) => (Number.isFinite(v) && v > 0 ? v : 0));
-  const total = clean.reduce((a, b) => a + b, 0);
-  return total > 0 ? clean.map((v) => v / total) : null;
-}
-
-/** Probability of each level of a score answer, in level order, or null without a distribution. */
+/** Probability of each score level in level order, or null when omitted. */
 export function levelProbabilities(answer, labels) {
-  const p = answer?.probabilities;
-  const values = Array.isArray(p) ? labels.map((label, i) => listEntry(p, label, i))
-    : p && typeof p === 'object' ? labels.map((label, i) => p[label] ?? p[i] ?? p[String(i)]) : [];
-  return normalize(values.map((v) => (typeof v === 'object' && v ? v.probability : v)));
+  return distribution(answer, labels, true);
 }
 
-/**
- * The level index a score answer points to: the `quantile` of its distribution (median by
- * default), which respects the order of the levels; the rounded score without a distribution.
- * @returns {{level:number, probs:number[]|null}}
- */
+/** Select by quantile when a distribution exists, or by the rounded score alone. */
 export function scoreLevel(answers, name, labels, quantile = 0.5) {
   const answer = expectAnswer(answers, name, 'score');
   const probs = levelProbabilities(answer, labels);
   const top = labels.length - 1;
+  if (Object.hasOwn(answer, 'score') && (!Number.isFinite(answer.score) || answer.score < 0 || answer.score > top)) {
+    throw malformed(`Luna returned an out-of-range score for "${name}"`);
+  }
   if (probs) return { level: quantileIndex(probs, quantile), probs };
-  if (!Number.isFinite(answer.score)) throw new Error(`Luna returned a score without a value for "${name}"`);
-  return { level: Math.max(0, Math.min(top, Math.round(answer.score))), probs: null };
+  if (answer.score === undefined) throw malformed(`Luna returned a score without a value for "${name}"`);
+  return { level: Math.round(answer.score), probs: null };
 }
 
-/** Index at the `quantile` of an ordered distribution; a zero-weight entry is never picked. */
+/** Index at the quantile of an ordered distribution. Zero-weight entries are skipped. */
 export function quantileIndex(probs, quantile = 0.5) {
   let cumulative = 0;
   for (let i = 0; i < probs.length; i++) {
     cumulative += probs[i];
     if (probs[i] > 0 && cumulative >= quantile - 1e-9) return i;
   }
-  return probs.length - 1;
+  return probs.findLastIndex((p) => p > 0);
 }
 
-/**
- * A choice answer: the chosen value (validated against `values`) and the probability of every
- * value, in `values` order. Without a distribution, the chosen value carries the confidence.
- * @returns {{choice:string, probs:number[], confidence:number}}
- */
 export function choiceAnswer(answers, name, values) {
   const answer = expectAnswer(answers, name, 'choice');
-  if (!values.includes(answer.choice)) throw new Error(`Luna returned an unknown choice for "${name}"`);
-  const p = answer.probabilities;
-  const raw = values.map((v) => {
-    const x = Array.isArray(p) ? p.find((e) => e?.value === v)?.probability
-      : p && typeof p === 'object' ? (typeof p[v] === 'object' ? p[v]?.probability : p[v]) : undefined;
-    return Number.isFinite(x) ? x : undefined;
-  });
-  let probs = raw.every((x) => x === undefined) ? null : normalize(raw.map((x) => x ?? 0));
-  const fallbackConfidence = Number.isFinite(answer.confidence) ? answer.confidence : 1;
-  if (!probs) {
-    const rest = values.length > 1 ? (1 - fallbackConfidence) / (values.length - 1) : 0;
-    probs = values.map((v) => (v === answer.choice ? fallbackConfidence : rest));
-  }
-  const confidence = Number.isFinite(answer.confidence) ? answer.confidence : Math.max(...probs);
-  return { choice: answer.choice, probs, confidence };
+  if (!values.includes(answer.choice)) throw malformed(`Luna returned an unknown choice for "${name}"`);
+  const probs = distribution(answer, values, false);
+  const confidence = reportedConfidence(answer);
+  return { choice: answer.choice, probs, confidence: confidence ?? probs?.[values.indexOf(answer.choice)] ?? null, reportedConfidence: confidence };
 }
 
-/** Confidence of a score answer: its own field, else the top level probability, else 1. */
-export function scoreConfidence(answers, name, probs) {
-  const c = answers?.[name]?.confidence;
-  if (Number.isFinite(c)) return c;
-  return probs ? Math.max(...probs) : 1;
+export function scoreConfidence(answers, name, probs, level) {
+  return reportedConfidence(answers[name]) ?? probs?.[level] ?? null;
 }

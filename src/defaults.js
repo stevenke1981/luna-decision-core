@@ -24,6 +24,7 @@ export const DEFAULTS = {
   // The effort ladder, least to most. A score question takes 2 to 10 levels.
   ladder: ['low', 'medium', 'high', 'xhigh', 'max'],
   route: {
+    start: null, // Optional { model, effort } for deterministic initial routing.
     effortQuantile: 0.5,
     // Models are ordered by tier (cheap to strong); the quantile of Luna's distribution over
     // that order picks the model, so an unsure Luna does not jump to the most expensive one.

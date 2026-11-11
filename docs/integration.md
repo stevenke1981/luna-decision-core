@@ -212,3 +212,51 @@ sidecar 無法連線時，harness 應使用自己的預設值繼續執行，不�
 - [ ] `luna-core route --task "rename a variable in one file"` 回傳一筆 Decision（heuristic 模式下 `source` 為 `rules`）。
 - [ ] `decisions.jsonl` 在決策後新增一行，且沒有任務原文。
 - [ ] MCP 設定檔與 `AGENTS.md`／`CLAUDE.md` 中沒有任何金鑰。
+
+## Codex generation routing
+
+Use `examples/codex.config.json` as the routing catalog and
+`examples/codex-route.json` as a sample request. The context windows and effort
+allowlists in the example are policy settings. Set them for your own executor.
+
+```sh
+node bin/luna-core.js route --config examples/codex.config.json --input-json examples/codex-route.json
+```
+
+The same request object works with `engine.route(input)`, HTTP
+`POST /v1/decide/route`, and the MCP tool `luna_route`.
+
+1. Read Codex App Server `model/list` for the active executor and follow all
+   `nextCursor` pages. Map each visible entry's `id` and
+   `supportedReasoningEfforts[].reasoningEffort` to `availableModels`.
+   An empty list means that no configured model can run on this executor.
+2. Send generation outcomes in `attempts` from oldest to newest. Record the
+   model and effort actually used. Give each generation one unique `attemptId`.
+   Use `pending` for in-flight work. A success resets the failure history used
+   for escalation. Pass `attempts: []` for a new task. Older clients may omit
+   `attempts` to keep step-based escalation.
+3. Apply `result.model` and `result.effort` on the next Codex turn using the
+   executor's model and effort controls. Confirm the effective configuration
+   before recording the next attempt. The route result itself is a recommendation.
+
+With the sample catalog, a fresh task starts on Sol at medium effort. The first
+failure retries that pair, the second raises to high on Sol, and a failure at
+that raised effort promotes to Astra at high. Promotion checks higher tiers in
+ascending order and keeps the required effort floor. A starting or retry
+decision resolved by policy skips the Luna request. For discretionary decisions,
+Luna receives only eligible models and the model question is omitted when one
+model is eligible.
+
+The SDK throws an error with `code` for classified decision failures. HTTP and
+MCP expose `errorCode`, and CLI diagnostics end with the same code in brackets.
+HTTP uses 400 for `NO_ELIGIBLE_MODEL`, 422 for `ESCALATION_EXHAUSTED`, and 502 for
+strict Luna failures. Auto-mode upstream fallback includes `error` and
+`errorCode` on the successful rules result. Expected upstream codes include
+`LUNA_AUTH`, `LUNA_TIMEOUT`, `LUNA_RATE_LIMIT`, `LUNA_HTTP`, `LUNA_TRANSPORT`,
+`LUNA_MALFORMED_ANSWER`, `LUNA_REFUSED`, and `LUNA_LOW_CONFIDENCE`.
+Luna route verdicts also expose `result.lunaSelection` with the original
+suggestion, reported confidence, and the probability of each selected option
+when available. These fields describe Luna's suggestion before rules or
+executor effort matching.
+
+[Codex App Server model discovery and turn controls](https://learn.chatgpt.com/docs/app-server)

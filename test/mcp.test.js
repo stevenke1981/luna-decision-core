@@ -91,7 +91,7 @@ test('tools/list names the six tools, each with a closed input schema that mirro
     }
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.inputSchema]));
     assert.deepEqual(byName.luna_route.required, ['task']);
-    assert.deepEqual(Object.keys(byName.luna_route.properties).sort(), ['candidates', 'contextTokens', 'localOnly', 'requires', 'steps', 'task']);
+    assert.deepEqual(Object.keys(byName.luna_route.properties).sort(), ['attempts', 'availableModels', 'candidates', 'contextTokens', 'localOnly', 'requires', 'steps', 'task']);
     assert.deepEqual(byName.luna_remember.properties.source.enum, ['user', 'agent', 'tool']);
     assert.deepEqual(byName.luna_remember.properties.type.enum, ['user', 'feedback', 'project', 'reference']);
     assert.deepEqual(byName.luna_compress.required, ['window', 'segments']);

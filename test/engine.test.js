@@ -438,3 +438,17 @@ test('the engine re-reads a repository once its cached index is older than cache
   const fresh = await ask();
   assert.deepEqual(fresh.result.chunks.map((c) => c.source), ['b.js']);
 }));
+
+test('auto mode propagates gate programming errors without returning a fallback', () => withHome(async (home) => {
+  const problem = new Error('gate bug');
+  const fake = fakeLuna({ predicates: { ok: 0.95 } });
+  const engine = createEngine({
+    config: configFor(home),
+    transport: fake.transport,
+    kinds: { alpha: stub('alpha', { gate: () => { throw problem; } }) },
+  });
+  await assert.rejects(engine.decide('alpha', { task: 'x' }), (err) => err === problem);
+  assert.equal(engine.stats().lunaCalls, 1);
+  assert.equal(engine.stats().fallbacks, 0);
+  assert.equal(readLedger(home)[0].errorCode, 'INTERNAL_ERROR');
+}));

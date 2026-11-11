@@ -6,7 +6,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { createEngine } from './engine.js';
+import { createEngine, decisionErrorCode } from './engine.js';
+import { DecisionError } from './errors.js';
 import { loadConfig } from './config.js';
 import { MODES } from './defaults.js';
 import { KIND_MODULES } from './registry.js';
@@ -28,6 +29,7 @@ const USAGE = `Usage: luna-core <command> [options]
 Commands:
   probe                        one live Luna call (route, strict mode); needs an API key
   route --task T               model and effort   [--context-tokens N] [--requires a,b] [--local-only]
+  route --input-json FILE      route with the same JSON input as HTTP and MCP
   skills --task T              skills to load     [--dir D ...] (repeat --dir for more folders)
   retrieve --query Q           context chunks     [--root R] [--budget N] [--force]
   recall --query Q             stored memories that apply
@@ -49,8 +51,9 @@ Keys: LUNA_API_KEY or OPENAI_API_KEY, from the environment or an env file.
 
 /** A bad command line or a bad option value. Exits 2, like any TypeError (bad input). */
 export class UsageError extends TypeError {
-  constructor(message) {
+  constructor(message, code = 'INVALID_INPUT') {
     super(message);
+    this.code = code;
     this.name = 'UsageError';
   }
 }
@@ -62,7 +65,7 @@ const COMMON_OPTIONS = { mode: str, config: str, help: { type: 'boolean', short:
 
 const COMMANDS = Object.freeze({
   probe: { options: {}, run: runProbe },
-  route: { options: { task: str, 'context-tokens': str, requires: str, 'local-only': flag }, run: runRoute },
+  route: { options: { 'input-json': str, task: str, 'context-tokens': str, requires: str, 'local-only': flag }, run: runRoute },
   skills: { options: { task: str, dir: multi }, run: runSkills },
   retrieve: { options: { query: str, root: str, budget: str, force: flag }, run: runRetrieve },
   recall: { options: { query: str }, run: runRecall },
@@ -125,7 +128,8 @@ async function dispatch(argv, io) {
 function report(io, err) {
   const usage = err instanceof UsageError;
   const secrets = KEY_VARIABLES.map((key) => io.env[key]);
-  io.stderr.write(`luna-core: ${scrubSecrets(err?.message ?? err, secrets)}\n`);
+  const code = usage ? err.code : decisionErrorCode(err);
+  io.stderr.write(`luna-core: ${scrubSecrets(err?.message ?? err, secrets)} [${code}]\n`);
   if (usage) io.stderr.write(`${HELP_HINT}\n`);
   return usage ? EXIT.USAGE : EXIT.ERROR;
 }
@@ -181,7 +185,7 @@ function checkInput(kind, input, config) {
   try {
     KIND_MODULES[kind].normalize(input, config);
   } catch (err) {
-    throw new UsageError(err.message);
+    throw new UsageError(err.message, err instanceof DecisionError ? err.code : 'INVALID_INPUT');
   }
 }
 
@@ -198,7 +202,7 @@ async function runProbe({ values, io }) {
   }
   const config = configFor(io, values, { mode: PROBE_MODE });
   if (!config.apiKey) {
-    throw new Error('probe: no OpenAI API key; set LUNA_API_KEY or OPENAI_API_KEY in the environment or an env file');
+    throw new DecisionError('LUNA_AUTH', 'probe: no OpenAI API key; set LUNA_API_KEY or OPENAI_API_KEY in the environment or an env file');
   }
   const engine = createEngine({ config, transport: io.transport });
   writeJson(io.stdout, await engine.route({ task: PROBE_TASK }));
@@ -206,6 +210,13 @@ async function runProbe({ values, io }) {
 }
 
 async function runRoute({ values, io }) {
+  if (values['input-json'] !== undefined) {
+    if (['task', 'context-tokens', 'requires', 'local-only'].some((key) => values[key] !== undefined)) {
+      throw new UsageError('--input-json cannot be combined with route input flags');
+    }
+    const input = readInputFile(resolveIn(io.cwd, values['input-json']));
+    return decideAndPrint(io, configFor(io, values), 'route', input);
+  }
   const input = { task: requireOption(values, 'task') };
   const contextTokens = intOption(values, 'context-tokens', { min: 0 });
   if (contextTokens !== undefined) input.contextTokens = contextTokens;

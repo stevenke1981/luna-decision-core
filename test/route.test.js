@@ -331,3 +331,34 @@ test('plan, interpret, heuristic and gate never mutate their inputs or verdicts'
   assert.deepEqual(input, snapshot);
   assert.deepEqual([luna, rules], frozenCopies);
 });
+
+test('runtime effort intersection removes unavailable candidates before asking Luna', () => {
+  const input = route.normalize({ task: PLAIN, availableModels: [
+    { id: HAIKU, efforts: [] }, { id: SONNET, efforts: ['high'] },
+  ] }, cfg);
+  const plan = route.plan(input, cfg);
+  assert.deepEqual(plan.questions.map((q) => q.name), ['effort']);
+  const result = route.interpret(answersFor({ effort: LOW_EFFORT }), plan.ctx, cfg).result;
+  assert.deepEqual(pick(result), ['high', SONNET]);
+});
+
+test('a selected tier uses the best peer independently of alphabetical position', () => {
+  const profile = cfgWith([model('z-peer', 1), model('a-peer', 1), model('strong', 2)]);
+  const plan = route.plan(route.normalize({ task: PLAIN }, profile), profile);
+  const answers = answersFor({ model: { 'a-peer': 0.25, 'z-peer': 0.35, strong: 0.4 }, effort: LOW_EFFORT });
+  const decision = route.interpret(answers, plan.ctx, profile);
+  assert.equal(decision.result.model, 'z-peer');
+  assert.equal(decision.result.lunaSelection.modelConfidence, null);
+  assert.equal(decision.result.lunaSelection.modelProbability, 0.35);
+  assert.equal(decision.confidence, 0.35);
+});
+
+test('legacy gate uses the raw effort floor before model compatibility is applied', () => {
+  const profile = cfgWith([model('first', 1), model('narrow', 2, { efforts: ['medium'] }), model('strong', 3)]);
+  const input = route.normalize({ task: PLAIN, steps: [failed('one'), failed('two')] }, profile);
+  const plan = route.plan(input, profile);
+  const luna = route.interpret(answersFor({ model: { first: 0.1, narrow: 0.8, strong: 0.1 }, effort: LOW_EFFORT }), plan.ctx, profile);
+  assert.deepEqual(pick(luna.result), ['medium', 'narrow']);
+  const rule = route.heuristic(input, profile);
+  assert.deepEqual(pick(route.gate(luna, rule, input, profile).result), ['high', 'strong']);
+});

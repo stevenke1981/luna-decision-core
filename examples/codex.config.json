@@ -1,0 +1,23 @@
+{
+  "route": {
+    "start": { "model": "gpt-6.1-sol", "effort": "medium" },
+    "models": [
+      {
+        "id": "gpt-6.1-sol",
+        "tier": 1,
+        "contextWindow": 200000,
+        "capabilities": ["tools", "vision"],
+        "efforts": ["medium", "high", "xhigh"],
+        "strengths": "Default coding model for this executor"
+      },
+      {
+        "id": "gpt-6-astra",
+        "tier": 2,
+        "contextWindow": 200000,
+        "capabilities": ["tools", "vision"],
+        "efforts": ["medium", "high", "xhigh", "max"],
+        "strengths": "Escalation model for this executor"
+      }
+    ]
+  }
+}

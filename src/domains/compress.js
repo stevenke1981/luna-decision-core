@@ -249,7 +249,7 @@ export function interpret(answers, ctx, cfg) {
   const picks = asked.map(({ name, id }) => ({ id, ...choiceAnswer(answers, name, ACTIONS) }));
   const compact = input.force || ratio >= hardRatio || (pCompact !== null && pCompact >= COMPACT_PROBABILITY);
   const decisions = Object.fromEntries(picks.map((p) => [p.id, p.choice]));
-  const confidence = pCompact !== null ? certainty(pCompact) : mean(picks.map((p) => p.confidence));
+  const confidence = pCompact !== null ? certainty(pCompact) : mean(picks.map((p) => p.confidence).filter((confidence) => confidence !== null));
   return verdict(resultFrom(input, cfg, compact, decisions), confidence, compactReasons(input, ratio, hardRatio, pCompact));
 }
 

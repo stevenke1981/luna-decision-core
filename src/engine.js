@@ -3,10 +3,11 @@
 // the rules → finalize → ledger. Modes: `auto` falls back to the rules on any Luna error; `luna`
 // fails the decision after it is logged; `heuristic` is rules only and never calls the transport.
 // The registry and the default deps are imported lazily, only when they are not injected.
+import { DecisionError, errorCode } from './errors.js';
 import { redactDeep } from './contract.js';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { askLuna, callCost, postDecision } from './luna/client.js';
+import { askLuna, callCost, postDecision, validateQuestions } from './luna/client.js';
 import { answersByName } from './luna/answers.js';
 import { lunaOptions } from './config.js';
 import { createLedger } from './ledger.js';
@@ -128,39 +129,43 @@ function addCall(spend, { cost, tokens }) {
   };
 }
 
-/** Asks Luna, interprets the answers, abstains below minConfidence, then gates against the rules. */
-async function lunaVerdict(ctx, kind, mod, input, p, meter) {
-  // `kind` is set after the state, so a kind module cannot change which kind the ledger and Luna see.
-  const batch = await askLuna(ctx.opts, redactDeep({ ...p.state, kind }), p.questions, meter.wrap(ctx.send));
-  const luna = mod.interpret(answersByName(batch), p.ctx, ctx.config);
-  if (luna.confidence != null && luna.confidence < ctx.config.minConfidence) {
-    throw new Error(`${kind}: Luna abstained (confidence ${luna.confidence} < minConfidence ${ctx.config.minConfidence})`);
-  }
-  const rules = mod.heuristic(input, ctx.config);
-  return mod.gate ? mod.gate(luna, rules, input, ctx.config) : luna;
-}
-
-/**
- * One pass at the verdict, without prepare or finalize. Never throws a Luna failure: it returns
- * `{error, spend}` in strict mode and the rules' verdict with `error` in auto mode.
- * @returns {Promise<{verdict?: object, source: string, spend: object, error?: Error}>}
- */
+/** One upstream attempt, with local planning and policy outside its fallback boundary. */
 async function attempt(ctx, kind, mod, input) {
   if (ctx.config.mode === MODE_HEURISTIC) {
-    return { verdict: mod.heuristic(input, ctx.config), source: SOURCE_RULES, spend: NO_SPEND };
+    return { source: SOURCE_RULES, spend: NO_SPEND };
   }
   const p = mod.plan(input, ctx.config);
   if (p.settled) return { verdict: p.settled, source: SOURCE_SETTLED, spend: NO_SPEND };
+  validateQuestions(p.questions);
+  const state = redactDeep({ ...p.state, kind });
   const meter = createMeter();
+  let batch;
   try {
-    const verdict = await lunaVerdict(ctx, kind, mod, input, p, meter);
-    return { verdict, source: verdict.source ?? SOURCE_LUNA, spend: meter.snapshot() };
+    batch = await askLuna(ctx.opts, state, p.questions, meter.wrap(ctx.send));
   } catch (err) {
-    const error = toError(err);
-    const spend = meter.snapshot();
-    if (ctx.config.mode === MODE_STRICT) return { error, spend, source: null };
-    return { verdict: mod.heuristic(input, ctx.config), source: SOURCE_RULES, spend, error };
+    return upstreamFailure(ctx, err, meter);
   }
+  try {
+    const luna = mod.interpret(answersByName(batch), p.ctx, ctx.config);
+    if (luna.confidence != null && luna.confidence < ctx.config.minConfidence) {
+      throw new DecisionError('LUNA_LOW_CONFIDENCE',
+        `${kind}: Luna abstained (confidence ${luna.confidence} < minConfidence ${ctx.config.minConfidence})`);
+    }
+    return { verdict: luna, source: SOURCE_LUNA, spend: meter.snapshot() };
+  } catch (err) {
+    if (!(err instanceof DecisionError)) throw err;
+    return upstreamFailure(ctx, err, meter);
+  }
+}
+
+function upstreamFailure(ctx, err, meter) {
+  const error = toError(err);
+  const source = ctx.config.mode === MODE_STRICT ? null : SOURCE_RULES;
+  return { error, source, spend: meter.snapshot() };
+}
+
+export function decisionErrorCode(error, fallback) {
+  return errorCode(error, isLunaFailure(error) ? 'LUNA_TRANSPORT' : fallback);
 }
 
 function buildDecision(kind, step, verdict, latencyMs) {
@@ -174,7 +179,7 @@ function buildDecision(kind, step, verdict, latencyMs) {
     tokens: step.spend.tokens,
     calls: step.spend.calls,
     latencyMs,
-    ...(step.error ? { error: step.error.message } : {}),
+    ...(step.error ? { error: step.error.message, errorCode: errorCode(step.error, 'LUNA_TRANSPORT') } : {}),
   });
 }
 
@@ -191,6 +196,7 @@ function failureDecision(kind, step, latencyMs) {
     calls: step.spend.calls,
     latencyMs,
     error: step.error.message,
+    errorCode: decisionErrorCode(step.error),
     summary: null,
   };
 }
@@ -263,9 +269,21 @@ export function createEngine({ config, transport = postDecision, kinds, deps, le
     stats = countSpend(stats, step.spend);
     if (step.error) stats = countError(stats);
     if (step.error && config.mode === MODE_STRICT) {
-      log.append(failureDecision(kind, step, elapsedSince(t0)));
       lunaFailures.add(step.error);
+      log.append(failureDecision(kind, step, elapsedSince(t0)));
       throw step.error;
+    }
+    try {
+      if (step.source === SOURCE_LUNA && mod.gate) {
+        step.verdict = mod.gate(step.verdict, mod.heuristic(prepared, config), prepared, config);
+        step.source = step.verdict.source ?? SOURCE_LUNA;
+      } else {
+        step.verdict ??= mod.heuristic(prepared, config);
+      }
+    } catch (err) {
+      if (!step.error) stats = countError(stats);
+      log.append(failureDecision(kind, { ...step, error: toError(err) }, elapsedSince(t0)));
+      throw err;
     }
     if (!Object.hasOwn(BUCKET_OF_SOURCE, step.source)) throw new Error(`${kind}: invalid source "${step.source}"`);
     const finished = (await mod.finalize?.(step.verdict, prepared, config, d)) ?? step.verdict;
