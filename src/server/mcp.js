@@ -4,7 +4,9 @@
 // JSON-RPC lines; diagnostics go to `log` (stderr by default). Requests are handled concurrently
 // and each reply carries its request id.
 import readline from 'node:readline';
-import { MEMORY_TYPES } from '../defaults.js';
+import { decisionErrorCode } from '../engine.js';
+import { ATTEMPT_OUTCOMES } from '../domains/route.js';
+import { EFFORTS, MEMORY_TYPES } from '../defaults.js';
 import { VERSION } from '../version.js';
 import { scrubSecrets } from './http.js';
 
@@ -29,6 +31,17 @@ const STEP = closed({
   command: str('The command or action, as text.'),
   failed: { type: ['boolean', 'null'], description: 'true if it failed, false if it passed, null if still running.' },
 }, ['kind', 'command']);
+const EFFORT = { type: 'string', enum: EFFORTS };
+const ATTEMPT = closed({
+  attemptId: str('Unique generation attempt id.'),
+  model: str('The model actually used.'),
+  effort: EFFORT,
+  outcome: { type: 'string', enum: ATTEMPT_OUTCOMES },
+}, ['attemptId', 'model', 'effort', 'outcome']);
+const AVAILABLE_MODEL = closed({
+  id: str('Model id reported by the executor.'),
+  efforts: list('Reasoning efforts supported by the executor.', EFFORT),
+}, ['id', 'efforts']);
 const SKILL = closed({
   name: str('Skill name.'),
   description: str('What the skill is for.'),
@@ -58,7 +71,9 @@ const TOOLS = Object.freeze([
     description: 'Choose the model and reasoning effort for the next generation of a coding task.',
     inputSchema: closed({
       task: str('The user task.'),
-      steps: list('Recent agent steps, oldest first; a failure streak raises the effort.', STEP),
+      steps: list('Recent agent steps, oldest first. Used for legacy escalation when attempts is omitted.', STEP),
+      attempts: list('Generation outcomes, oldest first.', ATTEMPT),
+      availableModels: list('Current executor model and effort capabilities.', AVAILABLE_MODEL),
       contextTokens: num('Tokens of context the request carries; the model window must fit it.', 0),
       requires: list('Capabilities the model must have, e.g. tools, vision.', { type: 'string' }),
       localOnly: flag('Only local models are eligible.'),
@@ -182,11 +197,14 @@ async function callTool(params, ctx) {
   if (!tool) throw new RpcError(CODE.INVALID_PARAMS, `Unknown tool: ${String(params.name)}`);
   const args = params.arguments ?? {};
   const problem = violation(tool.inputSchema, args, 'arguments');
-  if (problem) return toolResult({ error: problem }, true);
+  if (problem) return toolResult({ error: problem, errorCode: 'INVALID_INPUT' }, true);
   try {
     return toolResult(await ctx.engine.decide(tool.kind, args), false);
   } catch (err) {
-    return toolResult({ error: scrubSecrets(err?.message ?? err, ctx.secrets) }, true);
+    return toolResult({
+      error: scrubSecrets(err?.message ?? err, ctx.secrets),
+      errorCode: decisionErrorCode(err, err instanceof TypeError ? 'INVALID_INPUT' : 'INTERNAL_ERROR'),
+    }, true);
   }
 }
 

@@ -309,7 +309,7 @@ function interpretWrite(answers, ctx, cfg) {
   const notDurable = durable < cfg.memory.durableThreshold;
   const chosen = notDurable ? 'skip' : action.choice;
   const targetId = chosen === 'update' ? targetFor(answers, ctx.similar) : null;
-  const reasons = [`luna action ${action.choice} (${action.confidence.toFixed(2)})`, `durable ${durable.toFixed(2)}`];
+  const reasons = [`luna action ${action.choice} (${action.confidence?.toFixed(2) ?? 'unknown confidence'})`, `durable ${durable.toFixed(2)}`];
   if (notDurable) reasons.push(`not durable enough (below ${cfg.memory.durableThreshold}): skip`);
   return verdict(writeResult(chosen, type, targetId, ctx.observation), action.confidence, reasons);
 }

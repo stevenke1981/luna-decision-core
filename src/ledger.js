@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const LEDGER_FIELDS = Object.freeze(['kind', 'source', 'confidence', 'cost', 'tokens', 'calls', 'latencyMs', 'error', 'summary']);
+export const LEDGER_FIELDS = Object.freeze(['kind', 'source', 'confidence', 'cost', 'tokens', 'calls', 'latencyMs', 'error', 'errorCode', 'summary']);
 
 /**
  * The record written for a decision: a timestamp and the whitelisted fields, absent ones null.

@@ -91,35 +91,38 @@ failing after high effort".
 
 ### 4.1 `route` — `src/domains/route.js`, export `route`
 
-Input: `{ task: string, steps?: Step[], contextTokens?: number ≥0, requires?: string[],
-localOnly?: boolean, candidates?: string[] }`, `Step = { kind: 'read'|'edit'|'verify'|'exec'|'tool',
-command: string, failed: boolean|null }`.
+The route accepts a task, optional context and capability requirements, and
+either generation `attempts` or legacy tool `steps`. See
+[the integration guide](integration.md#codex-generation-routing) for examples.
 
-Eligible models (normalize/plan, same in heuristic): `cfg.route.models` filtered by `candidates`
-(if given; unknown ids → TypeError), `contextWindow ≥ ceil(contextTokens × contextHeadroom)`,
-`capabilities ⊇ requires`, `localOnly → m.local`; sorted by `tier` then `id`. None eligible →
-`Error('route: no eligible model (...)')` from normalize (all modes).
+Eligibility intersects the configured catalog with the request's candidates,
+context window with headroom, capabilities, locality, and executor
+`availableModels`. The last filter also intersects each model's effort list.
+An empty result raises `NO_ELIGIBLE_MODEL` before Luna is called.
 
-Plan: state `{ task: excerpt 2000, recent_steps: last 8 {kind, command: excerpt 160, status
-ok|failed|pending}, failures_in_a_row, context_tokens, models: [{id, tier, strengths}] }`.
-Questions: choice `model` (only when ≥ 2 eligible; choices `{value: id, description: "tier N:
-strengths"}`), score `effort` (levels = `cfg.ladder`, descriptions above).
+Generation retry policy considers completed failures after the last success.
+The first failure retries its model and effort. Two failures at the same
+model and effort require a higher effort on that model when one is available.
+A failure at the raised effort moves to a higher tier that meets the floor.
+A missing current model also requires a higher eligible tier. Higher tiers
+are tried in ascending order, with catalog order resolving peers.
+If no candidate can meet the floor, the policy raises `ESCALATION_EXHAUSTED`.
+A configured `route.start` selects the starting model and effort. Deterministic
+start and retry decisions settle before any Luna call.
 
-Interpret: model = eligible[`quantileIndex(probs in tier order, modelQuantile)`] (single eligible →
-it); effort = ladder[`scoreLevel(..., effortQuantile)`], then clamped to the model's `efforts`
-(nearest by EFFORTS index, ties upward). Confidence = min(model choice confidence, effort
-confidence) (effort only when one model).
+For discretionary routing, Luna sees the eligible models, the task excerpt
+and recent tool steps. The model question is omitted for a single candidate.
+The model distribution is evaluated by tier quantile. Within the selected
+tier, the answer's choice wins if it is in that tier, followed by the most
+likely peer, with catalog order breaking ties. The effort is selected by
+ladder quantile and matched to the model's supported efforts. The result
+contains the selected model and effort, fallback chain, available
+distributions, and separate Luna confidence and selected-option probabilities.
 
-Result: `{ model, effort, fallbackChain: string[] /* eligible ids with higher tier, ascending */,
-modelProbabilities: {id: p}|null, effortProbabilities: {label: p}|null }`.
-
-Heuristic: difficulty d (ladder index): greeting → 0; failure streak ≥ 3 or the same failing
-command twice in the last 6 → top; streak 2 → 2; streak 1 → max(1, base); `HARD_TASK` /
-`DEEP_QUESTION` / task > 600 chars → 2; else 1 (clamped to ladder). Model: d ≤ 1 → eligible[0];
-d = 2 → eligible[floor((n−1)/2)]; d ≥ 3 → eligible[n−1]. Effort = ladder[d] clamped to the model.
-
-Gate: when `steps` end in a failure streak ≥ 1, take the higher of Luna's and the rules' model
-tier and effort (source `luna+rules` if anything changed); otherwise Luna's.
+When `attempts` is omitted, the existing step-based heuristic and failure gate
+apply. A failure gate retains the required effort floor before compatibility
+matching. The explicit generation policy uses `attempts` as the source of
+failure outcomes whenever that field is present.
 
 ### 4.2 `skills` — `src/domains/skills.js`, export `skills`; `src/skills/catalog.js`
 

@@ -6,6 +6,7 @@
 // Luna for that endpoint and key, so it costs one failure, not one per decision.
 import { createHash } from 'node:crypto';
 import { RUBRIC, CACHE_KEY } from '../rubric.js';
+import { DecisionError } from '../errors.js';
 import { redact } from '../contract.js';
 
 // Uncached input; output is free. Cached reads cost less, so this is an upper bound.
@@ -42,13 +43,17 @@ function pauseKey(opts) {
   return `${opts.url} ${createHash('sha256').update(opts.apiKey ?? '').digest('hex').slice(0, 16)}`;
 }
 
-function pause(opts, ms) {
-  pausedUntil.set(pauseKey(opts), Date.now() + ms);
+function pause(opts, ms, code) {
+  const key = pauseKey(opts);
+  const until = Date.now() + ms;
+  if (until > (pausedUntil.get(key)?.until ?? 0)) pausedUntil.set(key, { until, code });
 }
 
 function retryAfterMs(res) {
-  const s = Number(res.headers.get('retry-after'));
-  return Number.isFinite(s) && s > 0 ? Math.min(s * 1000, MAX_RETRY_AFTER_MS) : PAUSE_MS.rate;
+  const value = res.headers.get('retry-after')?.trim();
+  if (!value) return PAUSE_MS.rate;
+  const ms = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return Number.isNaN(ms) ? PAUSE_MS.rate : Math.min(Math.max(0, ms), MAX_RETRY_AFTER_MS);
 }
 
 /**
@@ -108,14 +113,25 @@ function headersFor(opts) {
   };
 }
 
-async function send(opts, body) {
+async function send(opts, body, signal) {
   try {
-    return await fetch(opts.url, {
-      method: 'POST', headers: headersFor(opts), body: JSON.stringify(body), signal: AbortSignal.timeout(opts.timeoutMs),
+    const res = await fetch(opts.url, {
+      method: 'POST', headers: headersFor(opts), body: JSON.stringify(body), signal,
     });
+    const data = await res.json().catch((err) => {
+      if (signal.aborted) throw signal.reason;
+      if (err instanceof SyntaxError) return null;
+      throw err;
+    });
+    return { res, data };
   } catch (err) {
-    if (err?.name === 'TimeoutError') pause(opts, PAUSE_MS.timeout);
-    throw err;
+    if (signal.aborted) {
+      pause(opts, PAUSE_MS.timeout, 'LUNA_TIMEOUT');
+      const timeout = new DecisionError('LUNA_TIMEOUT', 'Luna request timed out', { cause: err });
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
+    throw new DecisionError('LUNA_TRANSPORT', 'Luna transport failed', { cause: err });
   }
 }
 
@@ -124,25 +140,29 @@ async function send(opts, body) {
  * @param {LunaOptions} opts
  */
 export async function postDecision(opts, state, questions) {
-  if (!opts.apiKey) throw new Error('no OpenAI API key (set LUNA_API_KEY or OPENAI_API_KEY)');
-  const until = pausedUntil.get(pauseKey(opts)) ?? 0;
-  if (Date.now() < until) throw new Error(`Luna paused for ${Math.ceil((until - Date.now()) / 1000)} s after a failure`);
-  let mode = opts.cacheMode ?? 'explicit';
-  if (mode === 'explicit' && explicitCacheRejected) mode = 'implicit';
-  let res = await send(opts, requestBody(opts.model, state, questions, mode));
-  let body = await res.json().catch(() => null);
-  if (res.status === 400 && mode === 'explicit' && /cache/i.test(body?.error?.message ?? '')) {
-    explicitCacheRejected = true;
-    res = await send(opts, requestBody(opts.model, state, questions, 'implicit'));
-    body = await res.json().catch(() => null);
-  }
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) pause(opts, PAUSE_MS.auth);
-    if (res.status === 429) pause(opts, retryAfterMs(res));
-    const detail = scrubDetail(body?.error?.message ?? 'no error body', opts.apiKey);
-    throw new Error(`Luna HTTP ${res.status}: ${detail}`);
+  if (!opts.apiKey) throw new DecisionError('LUNA_AUTH', 'no OpenAI API key (set LUNA_API_KEY or OPENAI_API_KEY)');
+  const cooldown = pausedUntil.get(pauseKey(opts));
+  if (cooldown && Date.now() < cooldown.until) {
+    throw new DecisionError(cooldown.code, `Luna paused for ${Math.ceil((cooldown.until - Date.now()) / 1000)} s after a failure`);
   }
   pausedUntil.delete(pauseKey(opts));
+  const signal = AbortSignal.timeout(opts.timeoutMs);
+  let mode = opts.cacheMode ?? 'explicit';
+  if (mode === 'explicit' && explicitCacheRejected) mode = 'implicit';
+  let { res, data: body } = await send(opts, requestBody(opts.model, state, questions, mode), signal);
+  if (res.status === 400 && mode === 'explicit' && /cache/i.test(body?.error?.message ?? '')) {
+    explicitCacheRejected = true;
+    ({ res, data: body } = await send(opts, requestBody(opts.model, state, questions, 'implicit'), signal));
+  }
+  if (!res.ok) {
+    const auth = res.status === 401 || res.status === 403;
+    const rate = res.status === 429;
+    const code = auth ? 'LUNA_AUTH' : rate ? 'LUNA_RATE_LIMIT' : 'LUNA_HTTP';
+    if (auth) pause(opts, PAUSE_MS.auth, code);
+    if (rate) pause(opts, retryAfterMs(res), code);
+    const detail = scrubDetail(body?.error?.message ?? 'no error body', opts.apiKey);
+    throw new DecisionError(code, `Luna HTTP ${res.status}: ${detail}`);
+  }
   return body;
 }
 
@@ -166,7 +186,8 @@ export async function askLuna(opts, state, questions, transport = postDecision) 
   for (let i = 0; i < questions.length; i += size) {
     const body = await transport(opts, state, questions.slice(i, i + size));
     calls++;
-    if (Array.isArray(body?.answers)) answers.push(...body.answers);
+    if (!Array.isArray(body?.answers)) throw new DecisionError('LUNA_MALFORMED_ANSWER', 'Luna response has no answers array');
+    answers.push(...body.answers);
     const c = callCost(body?.usage);
     if (c.cost != null) {
       cost = (cost ?? 0) + c.cost;

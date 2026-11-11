@@ -207,3 +207,34 @@ test('loadConfig refuses a config file that is not JSON or not an object', () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('answers reject invalid scores, confidence, distributions and duplicate names', () => {
+  const invalid = { code: 'LUNA_MALFORMED_ANSWER' };
+  const scoreAnswer = { name: 's', type: 'score', score: 1 };
+  assert.throws(() => scoreLevel({ s: { ...scoreAnswer, score: 99, probabilities: [0, 1] } }, 's', ['a', 'b']), invalid);
+  assert.throws(() => scoreLevel({ s: { ...scoreAnswer, probabilities: [0, 0] } }, 's', ['a', 'b']), invalid);
+  assert.throws(() => scoreLevel({ s: { ...scoreAnswer, probabilities: [{ value: 0, label: 'b', probability: 1 }] } }, 's', ['a', 'b']), invalid);
+  assert.throws(() => choiceAnswer({ c: { name: 'c', type: 'choice', choice: 'a', confidence: 1.2 } }, 'c', ['a', 'b']), invalid);
+  assert.throws(() => answersByName({ answers: [scoreAnswer, scoreAnswer] }), invalid);
+  assert.equal(choiceAnswer({ c: { name: 'c', type: 'choice', choice: 'a' } }, 'c', ['a', 'b']).confidence, null);
+});
+
+test('postDecision applies an HTTP-date cooldown and preserves the rate-limit code', async () => {
+  let hits = 0;
+  const server = await serve((req, res) => {
+    req.resume();
+    hits++;
+    res.writeHead(429, { 'retry-after': new Date(Date.now() + 10_000).toUTCString() });
+    res.end('{}');
+  });
+  try {
+    const opts = { url: `http://127.0.0.1:${server.address().port}/v1/decisions`, apiKey: 'date-test', timeoutMs: 2000 };
+    await assert.rejects(postDecision(opts, {}, [P('x')]), { code: 'LUNA_RATE_LIMIT' });
+    await assert.rejects(postDecision(opts, {}, [P('x')]), { code: 'LUNA_RATE_LIMIT', message: /paused for (9|10) s/ });
+    assert.equal(hits, 1);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    resetLunaState();
+  }
+});

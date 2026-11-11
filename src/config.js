@@ -177,6 +177,11 @@ export function validateConfig(c) {
   }
   check(prob(c.route.effortQuantile) && prob(c.route.modelQuantile), 'route quantiles must be 0..1');
   checkModels(c.route.models);
+  if (c.route.start !== null) {
+    const start = c.route.start;
+    check(isPlainObject(start) && c.route.models.some((m) => m.id === start.model) && EFFORTS.includes(start.effort),
+      'route.start must name a configured model and a known effort');
+  }
   check(posInt(c.skills.shortlist) && posInt(c.skills.maxSkills) && prob(c.skills.threshold), 'skills: shortlist/maxSkills positive, threshold 0..1');
   check(posInt(c.retrieve.shortlist) && posInt(c.retrieve.budgetTokens) && prob(c.retrieve.threshold), 'retrieve: shortlist/budgetTokens positive, threshold 0..1');
   check(Array.isArray(c.retrieve.allowedRoots) && c.retrieve.allowedRoots.every((r) => typeof r === 'string' && path.isAbsolute(r)), 'retrieve.allowedRoots must list absolute paths');

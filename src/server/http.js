@@ -6,7 +6,7 @@
 // goes through scrubSecrets, so the API key never reaches a response or the log.
 import http from 'node:http';
 import { scrub } from '../contract.js';
-import { isLunaFailure } from '../engine.js';
+import { decisionErrorCode, isLunaFailure } from '../engine.js';
 import { KINDS } from '../defaults.js';
 import { KIND_MODULES } from '../registry.js';
 import { VERSION } from '../version.js';
@@ -15,7 +15,7 @@ import { VERSION } from '../version.js';
 export const BODY_LIMIT_BYTES = 1024 * 1024;
 const JSON_TYPE = 'application/json';
 const DECIDE_PATH = /^\/v1\/decide\/([^/]+)$/;
-const STATUS = Object.freeze({ OK: 200, BAD_INPUT: 400, FORBIDDEN: 403, NOT_FOUND: 404, TOO_LARGE: 413, MEDIA_TYPE: 415, UPSTREAM: 502, SERVER: 500 });
+const STATUS = Object.freeze({ OK: 200, BAD_INPUT: 400, FORBIDDEN: 403, NOT_FOUND: 404, TOO_LARGE: 413, MEDIA_TYPE: 415, UNPROCESSABLE: 422, UPSTREAM: 502, SERVER: 500 });
 
 const writeStderr = (line) => process.stderr.write(line);
 
@@ -35,8 +35,8 @@ function send(res, status, body, extra = {}) {
   res.end(text);
 }
 
-function sendError(res, ctx, status, message, extra) {
-  send(res, status, { ok: false, error: scrubSecrets(message, ctx.secrets) }, extra);
+function sendError(res, ctx, status, message, extra, code) {
+  send(res, status, { ok: false, error: scrubSecrets(message, ctx.secrets), ...(code ? { errorCode: code } : {}) }, extra);
 }
 
 /**
@@ -75,9 +75,11 @@ function decodeKind(raw) {
 
 /** A failed decision: 502 in strict mode (a Luna failure), 500 otherwise. Logged, then answered. */
 function failDecision(res, ctx, kind, err) {
-  const status = isLunaFailure(err) ? STATUS.UPSTREAM : STATUS.SERVER;
+  const code = decisionErrorCode(err);
+  const status = isLunaFailure(err) ? STATUS.UPSTREAM
+    : code === 'ESCALATION_EXHAUSTED' ? STATUS.UNPROCESSABLE : STATUS.SERVER;
   ctx.log(`luna-core: ${kind}: ${scrubSecrets(err?.message ?? err, ctx.secrets)}\n`);
-  sendError(res, ctx, status, err?.message ?? err);
+  sendError(res, ctx, status, err?.message ?? err, undefined, code);
 }
 
 /** The body of a decide request, validated by the kind's normalize before any work is done. */
@@ -97,7 +99,7 @@ async function parseDecideBody(req, res, ctx, kind) {
   try {
     KIND_MODULES[kind].normalize(input, ctx.config);
   } catch (err) {
-    sendError(res, ctx, STATUS.BAD_INPUT, err?.message ?? err);
+    sendError(res, ctx, STATUS.BAD_INPUT, err?.message ?? err, undefined, decisionErrorCode(err, 'INVALID_INPUT'));
     return undefined;
   }
   return { input };

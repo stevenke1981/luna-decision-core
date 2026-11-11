@@ -3,10 +3,12 @@
 // score over the effort ladder. The rules pick by difficulty when Luna is unavailable, and gate
 // Luna's answer so that a failing agent never gets less than the rules give it.
 import { DEEP_QUESTION, GREETING, HARD_TASK, redact, requireText, verdict } from '../contract.js';
+import { DecisionError } from '../errors.js';
 import { EFFORTS } from '../defaults.js';
 import { choiceAnswer, quantileIndex, scoreConfidence, scoreLevel } from '../luna/answers.js';
 import { excerpt } from '../text.js';
 
+export const ATTEMPT_OUTCOMES = ['success', 'failure', 'pending'];
 const STEP_KINDS = ['read', 'edit', 'verify', 'exec', 'tool'];
 const MAX_TASK_CHARS = 2000;
 const MAX_RECENT_STEPS = 8;
@@ -38,6 +40,7 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
 const squash = (command) => command.replace(/\s+/g, ' ').trim();
 const isHardTask = (task) => HARD_TASK.test(task) || DEEP_QUESTION.test(task) || task.length > LONG_TASK_CHARS;
 const statusOf = (failed) => (failed === null ? 'pending' : failed ? 'failed' : 'ok');
+const effortRank = (effort) => EFFORTS.indexOf(effort);
 const byTierThenId = (a, b) => a.tier - b.tier || (a.id < b.id ? -1 : 1);
 
 function normalizeStep(step, i) {
@@ -61,6 +64,32 @@ function normalizeList(value, field) {
     throw new TypeError(`route: ${field} must be an array of strings`);
   }
   return [...value];
+}
+
+function normalizeRecords(value, field, key, normalizeRecord) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new TypeError(`route: ${field} must be an array`);
+  const seen = new Set();
+  return value.map((record, index) => {
+    const at = `route: ${field}[${index}]`;
+    if (!isPlainObject(record)) throw new TypeError(`${at} must be an object`);
+    const id = requireText(record[key], `${at}.${key}`);
+    if (seen.has(id)) throw new TypeError(`${at}.${key} must be unique`);
+    seen.add(id);
+    return { [key]: id, ...normalizeRecord(record, at) };
+  });
+}
+
+function normalizeAttempt(record, at) {
+  if (!EFFORTS.includes(record.effort)) throw new TypeError(`${at}.effort is unknown`);
+  if (!ATTEMPT_OUTCOMES.includes(record.outcome)) throw new TypeError(`${at}.outcome is unknown`);
+  return { model: requireText(record.model, `${at}.model`), effort: record.effort, outcome: record.outcome };
+}
+
+function normalizeAvailableModel(record, at) {
+  const efforts = normalizeList(record.efforts, `${at}.efforts`);
+  if (efforts.some((effort) => !EFFORTS.includes(effort))) throw new TypeError(`${at}.efforts contains an unknown effort`);
+  return { efforts };
 }
 
 function normalizeContextTokens(value) {
@@ -101,11 +130,18 @@ export function eligibleModels(input, cfg) {
   if (wanted) assertKnownCandidates(wanted, models);
   const need = contextNeed(input, cfg);
   const requires = input.requires ?? [];
+  const available = input.availableModels && new Map(input.availableModels.map((m) => [m.id, new Set(m.efforts)]));
   return models
     .filter((m) => !wanted || wanted.includes(m.id))
     .filter((m) => m.contextWindow >= need)
     .filter((m) => requires.every((capability) => m.capabilities.includes(capability)))
     .filter((m) => !input.localOnly || m.local)
+    .flatMap((model) => {
+      if (!available) return [model];
+      const supported = available.get(model.id);
+      const efforts = model.efforts.filter((effort) => supported?.has(effort));
+      return efforts.length ? [{ ...model, efforts }] : [];
+    })
     .sort(byTierThenId);
 }
 
@@ -115,7 +151,8 @@ function noModelError(input, cfg) {
   if (input.requires?.length) why.push(`requires ${input.requires.join(', ')}`);
   if (input.localOnly) why.push('localOnly');
   if (input.candidates) why.push(`candidates [${input.candidates.join(', ')}]`);
-  return new Error(`route: no eligible model (${why.join('; ')})`);
+  if (input.availableModels) why.push('availableModels');
+  return new DecisionError('NO_ELIGIBLE_MODEL', `route: no eligible model (${why.join('; ')})`);
 }
 
 function eligibleOrThrow(input, cfg) {
@@ -134,6 +171,8 @@ function normalize(input, cfg) {
     requires: input.requires == null ? [] : normalizeList(input.requires, 'requires'),
     localOnly: normalizeFlag(input.localOnly),
     candidates: input.candidates == null ? null : normalizeList(input.candidates, 'candidates'),
+    attempts: normalizeRecords(input.attempts, 'attempts', 'attemptId', normalizeAttempt),
+    availableModels: normalizeRecords(input.availableModels, 'availableModels', 'id', normalizeAvailableModel),
   };
   eligibleOrThrow(normalized, cfg);
   return normalized;
@@ -177,14 +216,75 @@ function effortQuestion(ladder) {
   };
 }
 
+function minimumEffort(efforts, rank) {
+  return EFFORTS.find((effort, index) => index >= rank && efforts.includes(effort));
+}
+
+function fixedRoute(eligible, model, effort, reason) {
+  const compatible = eligible.filter((candidate) => minimumEffort(candidate.efforts, effortRank(effort)));
+  return verdict(resultFor(compatible, model, effort, {}), null, [reason], 'rules');
+}
+
+function promotion(eligible, tier, minimumRank, cfg) {
+  // Equal-tier models use the configured catalog order for deterministic promotion.
+  const order = new Map(cfg.route.models.map((m, index) => [m.id, index]));
+  const ordered = [...eligible].sort((a, b) => a.tier - b.tier || order.get(a.id) - order.get(b.id));
+  for (const model of ordered) {
+    if (model.tier <= tier) continue;
+    const effort = minimumEffort(model.efforts, minimumRank);
+    if (effort) return fixedRoute(eligible, model, effort, 'higher tier meets the required effort');
+  }
+  throw new DecisionError('ESCALATION_EXHAUSTED', 'route: no eligible model meets the escalation requirement');
+}
+
+function retryRoute(eligible, failed, cfg) {
+  const last = failed.at(-1);
+  const rank = effortRank(last.effort);
+  const current = eligible.find((m) => m.id === last.model);
+  const tier = cfg.route.models.find((m) => m.id === last.model)?.tier;
+  if (tier === undefined) {
+    throw new DecisionError('ESCALATION_EXHAUSTED', 'route: the last attempted model is absent from the routing catalog');
+  }
+  if (current) {
+    const previous = failed.at(-2);
+    const sameEffort = previous?.model === last.model && previous.effort === last.effort;
+    const raised = failed.some((attempt) => attempt.model === last.model && effortRank(attempt.effort) < rank);
+    if (!raised) {
+      const requiredRank = rank + Number(sameEffort);
+      const effort = minimumEffort(current.efforts, requiredRank);
+      if (effort) return fixedRoute(eligible, current, effort, effort === last.effort ? 'retry the same model' : 'raise effort on the same model');
+      if (sameEffort) return promotion(eligible, tier, Math.min(requiredRank, EFFORTS.length - 1), cfg);
+    }
+  }
+  return promotion(eligible, tier, rank, cfg);
+}
+
+function policyRoute(input, eligible, cfg) {
+  // Only generation outcomes after the last success count. Pending work does not break the streak.
+  const attempts = input.attempts ?? [];
+  const failed = attempts.slice(attempts.findLastIndex((a) => a.outcome === 'success') + 1)
+    .filter((a) => a.outcome === 'failure');
+  if (failed.length) return retryRoute(eligible, failed, cfg);
+  const start = cfg.route.start;
+  if (!start) return null;
+  const configured = cfg.route.models.find((m) => m.id === start.model);
+  const model = eligible.find((m) => m.id === start.model);
+  const rank = effortRank(start.effort);
+  const effort = model && minimumEffort(model.efforts, rank);
+  return effort ? fixedRoute(eligible, model, effort, 'configured starting model')
+    : promotion(eligible, configured.tier - 1, rank, cfg);
+}
+
 /** The state and questions for Luna; the eligible models are kept in `ctx` for interpret. */
 function plan(input, cfg) {
   const eligible = eligibleOrThrow(input, cfg);
+  const policy = policyRoute(input, eligible, cfg);
+  if (policy) return { settled: policy };
   return {
     state: {
       task: excerpt(redact(input.task), MAX_TASK_CHARS),
       recent_steps: recentSteps(input.steps),
-      failures_in_a_row: failureStreak(input.steps),
+      failures_in_a_row: input.attempts === undefined ? failureStreak(input.steps) : 0,
       context_tokens: input.contextTokens,
       models: eligible.map((m) => ({ id: m.id, tier: m.tier, strengths: m.strengths })),
     },
@@ -194,8 +294,7 @@ function plan(input, cfg) {
 }
 
 /**
- * The effort that is at least as high as the one asked, within the EFFORTS order. Where the
- * model does not declare the effort, the nearest one it declares is used; ties go upward.
+ * Nearest supported effort for a discretionary decision. Ties go upward.
  * A model with no declared efforts is not clamped.
  * @param {string} effort one of EFFORTS
  * @param {string[]} efforts the efforts the model supports
@@ -222,21 +321,28 @@ function resultFor(eligible, model, effort, probs) {
     fallbackChain: eligible.filter((m) => m.tier > model.tier).map((m) => m.id),
     modelProbabilities: probs.modelProbabilities ?? null,
     effortProbabilities: probs.effortProbabilities ?? null,
+    ...(probs.lunaSelection ? { lunaSelection: probs.lunaSelection } : {}),
   };
 }
 
 const byKey = (keys, values) => Object.fromEntries(keys.map((k, i) => [k, values[i]]));
 
 /** The model Luna picks: the quantile of its distribution over the tier-ordered models. */
-function pickModel(answers, eligible, quantile) {
+function pickModel(answers, eligible, quantile, cfg) {
   if (eligible.length === 1) return { model: eligible[0], probs: null, confidence: null };
-  const { probs, confidence } = choiceAnswer(answers, 'model', eligible.map((m) => m.id));
-  return { model: eligible[quantileIndex(probs, quantile)], probs, confidence };
+  const { probs, choice, confidence, reportedConfidence } = choiceAnswer(answers, 'model', eligible.map((m) => m.id));
+  if (!probs) return { model: eligible.find((m) => m.id === choice), probs, confidence, reportedConfidence };
+  const tier = eligible[quantileIndex(probs, quantile)].tier;
+  const peers = cfg.route.models.filter((m) => m.tier === tier)
+    .map((m) => eligible.find((candidate) => candidate.id === m.id)).filter(Boolean);
+  const model = peers.find((peer) => peer.id === choice)
+    ?? peers.reduce((best, peer) => probs[eligible.indexOf(peer)] > probs[eligible.indexOf(best)] ? peer : best);
+  return { model, probs, confidence: reportedConfidence ?? probs[eligible.indexOf(model)], reportedConfidence };
 }
 
 function interpretReasons(picked, asked, chosen, cfg) {
   const reasons = [
-    picked.probs ? `model ${picked.model.id} at quantile ${cfg.route.modelQuantile}` : `only ${picked.model.id} is eligible`,
+    picked.probs ? `model ${picked.model.id} in tier at quantile ${cfg.route.modelQuantile}` : `model ${picked.model.id} selected directly`,
     `effort ${asked} at quantile ${cfg.route.effortQuantile}`,
   ];
   if (chosen !== asked) reasons.push(`effort ${asked} clamped to ${chosen} for ${picked.model.id}`);
@@ -246,17 +352,25 @@ function interpretReasons(picked, asked, chosen, cfg) {
 /** Luna's answers as a verdict. Throws on a refused or malformed answer. */
 function interpret(answers, ctx, cfg) {
   const { eligible } = ctx;
-  const picked = pickModel(answers, eligible, cfg.route.modelQuantile);
+  const picked = pickModel(answers, eligible, cfg.route.modelQuantile, cfg);
   const effort = scoreLevel(answers, 'effort', cfg.ladder, cfg.route.effortQuantile);
-  const effortConfidence = scoreConfidence(answers, 'effort', effort.probs);
-  // The effort's confidence counts alone only when there is no model question to compare with.
-  const confidence = picked.confidence == null ? effortConfidence : Math.min(picked.confidence, effortConfidence);
+  const effortConfidence = scoreConfidence(answers, 'effort', effort.probs, effort.level);
+  const availableConfidence = [picked.confidence, effortConfidence].filter((value) => value != null);
+  const confidence = availableConfidence.length ? Math.min(...availableConfidence) : null;
   const asked = cfg.ladder[effort.level];
   const chosen = clampEffort(asked, picked.model.efforts);
   const result = resultFor(eligible, picked.model, chosen, {
     modelProbabilities: picked.probs && byKey(eligible.map((m) => m.id), picked.probs),
     effortProbabilities: effort.probs && byKey(cfg.ladder, effort.probs),
   });
+  result.lunaSelection = {
+    model: picked.model.id,
+    effort: asked,
+    modelConfidence: picked.reportedConfidence ?? null,
+    effortConfidence: answers.effort.confidence ?? null,
+    modelProbability: result.modelProbabilities?.[picked.model.id] ?? null,
+    effortProbability: effort.probs?.[effort.level] ?? null,
+  };
   return verdict(result, confidence, interpretReasons(picked, asked, chosen, cfg));
 }
 
@@ -265,9 +379,10 @@ function difficulty(input, cfg) {
   const top = cfg.ladder.length - 1;
   const at = (level, reason) => ({ level: Math.min(level, top), reason });
   if (GREETING.test(input.task)) return at(LEVEL_GREETING, 'greeting');
-  const streak = failureStreak(input.steps);
+  const steps = input.attempts === undefined ? input.steps : [];
+  const streak = failureStreak(steps);
   if (streak >= STUCK_STREAK) return at(top, `${streak} failures in a row`);
-  if (repeatsFailure(input.steps)) return at(top, 'the same failing command repeated');
+  if (repeatsFailure(steps)) return at(top, 'the same failing command repeated');
   if (streak === TWO_IN_A_ROW) return at(LEVEL_HARD, 'two failures in a row');
   const hard = isHardTask(input.task);
   const reason = hard ? 'hard or long task' : 'routine task';
@@ -285,10 +400,14 @@ function modelAtLevel(eligible, level) {
 /** The rules' answer, for when Luna is unavailable or abstains. Same shape as interpret. */
 function heuristic(input, cfg) {
   const eligible = eligibleOrThrow(input, cfg);
+  const policy = policyRoute(input, eligible, cfg);
+  if (policy) return policy;
   const { level, reason } = difficulty(input, cfg);
   const model = modelAtLevel(eligible, level);
   const asked = cfg.ladder[level];
-  const effort = clampEffort(asked, model.efforts);
+  const failing = input.attempts === undefined && (failureStreak(input.steps) > 0 || repeatsFailure(input.steps));
+  const effort = failing ? minimumEffort(model.efforts, effortRank(asked)) : clampEffort(asked, model.efforts);
+  if (!effort) return promotion(eligible, model.tier, effortRank(asked), cfg);
   const reasons = [reason, `model ${model.id}`];
   if (effort !== asked) reasons.push(`effort ${asked} clamped to ${effort} for ${model.id}`);
   return verdict(resultFor(eligible, model, effort, {}), null, reasons);
@@ -309,12 +428,19 @@ const higherEffort = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a)
  */
 function gate(luna, rules, input, cfg) {
   const streak = failureStreak(input.steps);
-  if (streak < 1) return luna;
+  if (input.attempts !== undefined || streak < 1) return luna;
   const eligible = eligibleOrThrow(input, cfg);
   const lunaModel = findModel(eligible, luna.result.model);
   const ruleModel = findModel(eligible, rules.result.model);
-  const model = ruleModel.tier > lunaModel.tier ? ruleModel : lunaModel;
-  const effort = clampEffort(higherEffort(luna.result.effort, rules.result.effort), model.efforts);
+  let model = ruleModel.tier > lunaModel.tier ? ruleModel : lunaModel;
+  const floor = cfg.ladder[difficulty(input, cfg).level];
+  const minimumRank = effortRank(higherEffort(floor, higherEffort(luna.result.effort, rules.result.effort)));
+  let effort = minimumEffort(model.efforts, minimumRank);
+  if (!effort) {
+    const promoted = promotion(eligible, model.tier, minimumRank, cfg).result;
+    model = findModel(eligible, promoted.model);
+    effort = promoted.effort;
+  }
   if (model.id === luna.result.model && effort === luna.result.effort) return luna;
   const reasons = [...luna.reasons, `failure streak ${streak}: rules raise the answer to ${model.id} at ${effort}`];
   return verdict(resultFor(eligible, model, effort, luna.result), luna.confidence, reasons, 'luna+rules');

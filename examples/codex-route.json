@@ -1,0 +1,11 @@
+{
+  "task": "Diagnose why the test runner hangs after the last test.",
+  "availableModels": [
+    { "id": "gpt-6.1-sol", "efforts": ["medium", "high"] },
+    { "id": "gpt-6-astra", "efforts": ["medium", "high"] }
+  ],
+  "attempts": [
+    { "attemptId": "turn-1", "model": "gpt-6.1-sol", "effort": "medium", "outcome": "failure" },
+    { "attemptId": "turn-2", "model": "gpt-6.1-sol", "effort": "medium", "outcome": "failure" }
+  ]
+}
