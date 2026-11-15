@@ -10,9 +10,10 @@ import { createEngine, decisionErrorCode } from './engine.js';
 import { DecisionError } from './errors.js';
 import { loadConfig } from './config.js';
 import { MODES } from './defaults.js';
+import { requireText } from './contract.js';
 import { KIND_MODULES } from './registry.js';
 import { VERSION } from './version.js';
-import { scrubSecrets, startHttp } from './server/http.js';
+import { BODY_LIMIT_BYTES, scrubSecrets, startHttp } from './server/http.js';
 import { createMcpServer } from './server/mcp.js';
 
 /** Exit codes: 0 success, 1 a failed command (Luna, IO, config), 2 a usage or input error. */
@@ -28,6 +29,8 @@ const USAGE = `Usage: luna-core <command> [options]
 
 Commands:
   probe                        one live Luna call (route, strict mode); needs an API key
+  hook [--dir D ...]            Codex UserPromptSubmit JSON on stdin; strict decisions or block
+  hook-config [--dir D ...]    print Codex hooks.json for this installation (no API call)
   route --task T               model and effort   [--context-tokens N] [--requires a,b] [--local-only]
   route --input-json FILE      route with the same JSON input as HTTP and MCP
   skills --task T              skills to load     [--dir D ...] (repeat --dir for more folders)
@@ -46,6 +49,7 @@ Options for every command:
   --version                    the version
 
 Output is JSON on stdout and errors go to stderr. Exit codes: 0 ok, 1 error, 2 usage.
+The hook command returns exit 0 with a JSON blocking decision on failure.
 Keys: LUNA_API_KEY or OPENAI_API_KEY, from the environment or an env file.
 `;
 
@@ -65,6 +69,8 @@ const COMMON_OPTIONS = { mode: str, config: str, help: { type: 'boolean', short:
 
 const COMMANDS = Object.freeze({
   probe: { options: {}, run: runProbe },
+  hook: { options: { dir: multi }, run: runHook },
+  'hook-config': { options: { dir: multi }, run: runHookConfig },
   route: { options: { 'input-json': str, task: str, 'context-tokens': str, requires: str, 'local-only': flag }, run: runRoute },
   skills: { options: { task: str, dir: multi }, run: runSkills },
   retrieve: { options: { query: str, root: str, budget: str, force: flag }, run: runRetrieve },
@@ -147,6 +153,11 @@ export async function main(argv = [], options = {}) {
   try {
     return await dispatch(argv, io);
   } catch (err) {
+    if (argv[0] === 'hook') {
+      const secrets = KEY_VARIABLES.map((key) => io.env[key]);
+      writeJson(io.stdout, { decision: 'block', reason: `Luna Decision hook failed: ${scrubSecrets(err?.message ?? err, secrets)}` });
+      return EXIT.OK;
+    }
     return report(io, err);
   }
 }
@@ -193,6 +204,74 @@ async function decideAndPrint(io, config, kind, input) {
   checkInput(kind, input, config);
   const engine = createEngine({ config, transport: io.transport });
   writeJson(io.stdout, await engine.decide(kind, input));
+  return EXIT.OK;
+}
+
+/** A synchronous Codex prompt hook. Failures are converted to blocking JSON by main(). */
+async function runHook({ values, io }) {
+  if (values.mode !== undefined && values.mode !== 'luna') {
+    throw new UsageError('hook always runs in luna (strict) mode');
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of io.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > BODY_LIMIT_BYTES) throw new UsageError('hook input exceeds 1 MB');
+    chunks.push(bytes);
+  }
+  const event = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, ''));
+  if (event?.hook_event_name !== 'UserPromptSubmit') {
+    throw new UsageError('hook requires a UserPromptSubmit event');
+  }
+  const task = requireText(event.prompt, 'hook: prompt');
+  // Prompt hooks must ask Luna even when ordinary routing has a fixed starting model.
+  const config = configFor(io, values, { mode: 'luna', route: { start: null } });
+  const engine = createEngine({ config, transport: io.transport });
+  const route = await engine.route({ task });
+  const skills = await engine.skills({
+    task,
+    ...(values.dir !== undefined ? { dirs: values.dir.map((dir) => resolveIn(io.cwd, dir)) } : {}),
+  });
+  writeJson(io.stdout, {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: 'Luna Decision completed before this prompt. Read the selected SKILL.md files before applying their skills. Routing is a recommendation within the host capabilities and existing authorization; this hook does not change the active model.\n'
+        + JSON.stringify({
+          route: { source: route.source, result: route.result, calls: route.calls },
+          skills: { source: skills.source, result: skills.result, calls: skills.calls },
+        }),
+    },
+  });
+  return EXIT.OK;
+}
+
+/** Prints a host-local configuration without overwriting or trusting any hook file. */
+function runHookConfig({ values, io }) {
+  if (values.mode !== undefined && values.mode !== 'luna') {
+    throw new UsageError('hook always runs in luna (strict) mode');
+  }
+  const args = [
+    process.execPath, path.resolve(import.meta.dirname, '../bin/luna-core.js'), 'hook',
+    ...(values.config !== undefined ? ['--config', resolveIn(io.cwd, values.config)] : []),
+    ...(values.dir ?? []).flatMap((dir) => ['--dir', resolveIn(io.cwd, dir)]),
+  ];
+  const command = args.map((arg) => "'" + arg.replaceAll("'", "'\\''") + "'").join(' ');
+  // EncodedCommand avoids nested cmd.exe/PowerShell quoting and preserves Unicode paths.
+  // It encodes only this invocation, never credentials or the user prompt.
+  const windowsScript = '& ' + args.map((arg) => "'" + arg.replaceAll("'", "''") + "'").join(' ');
+  writeJson(io.stdout, {
+    description: 'Luna Decision: synchronous strict routing and skill selection before each prompt. Generated absolute paths are specific to this installation.',
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{
+        type: 'command',
+        command,
+        commandWindows: 'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + Buffer.from(windowsScript, 'utf16le').toString('base64'),
+        timeout: 30,
+        statusMessage: 'Running Luna Decision',
+      }] }],
+    },
+  });
   return EXIT.OK;
 }
 
