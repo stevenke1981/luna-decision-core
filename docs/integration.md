@@ -260,3 +260,46 @@ when available. These fields describe Luna's suggestion before rules or
 executor effort matching.
 
 [Codex App Server model discovery and turn controls](https://learn.chatgpt.com/docs/app-server)
+
+## 6. Codex 原生 hook：每次提示前強制決策
+
+MCP 註冊與 `AGENTS.md` 指引不會自動呼叫工具。需要每次使用者提示送出前都執行 Luna 時，可使用同步的 `UserPromptSubmit` command hook。事件與信任規則以 [Codex hooks 官方文件](https://learn.chatgpt.com/docs/hooks)為準。
+
+### 6.1 產生並安裝設定
+
+在 luna-decision-core 目錄執行（Node.js 須可執行）：
+
+```sh
+node bin/luna-core.js hook-config --config /absolute/path/to/your/config.json
+```
+
+`--config` 可省略，省略時使用既有設定搜尋規則。可重複傳入 `--dir /absolute/path/to/skills` 覆蓋技能目錄；否則使用設定中的 `skills.dirs`。請在設定中列出該 host 真正可用的 `route.models`。
+
+把輸出的 JSON 存到**欲套用專案**的 `.codex/hooks.json`；若已存在，僅合併 `hooks.UserPromptSubmit`，保留其他 hooks。產生指令只輸出設定，不覆寫檔案、不輸出金鑰，也不呼叫 API。設定包含本機 Node、CLI 與選項的絕對路徑，換電腦或移動工具後須重新產生；不要把這份本機設定提交到公開儲存庫。
+
+在 Codex CLI 執行 `/hooks` 檢查並信任，或在桌面版 Settings > Hooks 審查。hook 程序須能從環境或 env 檔讀到金鑰；若只在 Windows 使用者環境變數設定，已開啟的 Codex 可能需重新啟動才會繼承。未信任、hooks 被停用、專案未被信任或 host 不支援時，不代表已強制啟用。不要用略過 hook 信任的參數替代審查。
+
+Windows 設定使用 `commandWindows` 及 PowerShell `-EncodedCommand`，避免 Node 路徑空白、單引號與 Unicode 造成巢狀 shell 引號錯誤；編碼只包含可執行檔、CLI 路徑與明示選項，不含金鑰或提示。審查時可將最後的 Base64 參數解碼：
+
+```powershell
+[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('<EncodedCommand 的參數>'))
+```
+
+### 6.2 執行與失敗行為
+
+- hook 由 host 同步執行，從 stdin 讀取 `UserPromptSubmit` JSON，先做 `route`，再做 `skills`，完成後才回傳 developer context。
+- 固定使用 `luna` 嚴格模式，覆蓋設定及環境中的 `auto`／`heuristic`；明示傳入 `--mode auto` 或 `--mode heuristic` 會被阻擋。
+- 沒有金鑰、上游錯誤、低信心棄權、設定／輸入錯誤或技能決策失敗時，回傳 exit 0 與 `{"decision":"block","reason":"..."}`，由 Codex 阻擋提示。exit 0 表示 hook 回應格式有效，不表示決策通過。
+- 路由會呼叫 API；沒有技能候選時，技能決策可直接得到 `settled`，不額外花費。輸入限制為 1 MB。設定的 host timeout 為 30 秒，若自訂 API timeout 或技能批次較大，需一併調整。
+- 成功時將路由與技能結果加入 `hookSpecificOutput.additionalContext`，要求 agent 讀取選中的 `SKILL.md`。模型切換及決策採納仍由 host／agent 負責，hook 不變更模型、不擴大權限，也不攔截每次工具呼叫。
+- 每次正常提示都可能產生 OpenAI API 費用。這不是費用上限功能；請使用 API 專案的預算／用量管理。hook 程序無法啟動、逾時或遭 host 略過時，host 可能繼續，不能當成不可繞過的安全邊界。
+
+### 6.3 驗證與移除
+
+```sh
+node --test test/hook.test.js
+```
+
+測試使用假 transport、獨立臨時目錄及無金鑰子程序，不會呼叫 OpenAI。實際驗證時，先確認 `/hooks` 顯示已信任，再送出簡短提示，確認提示前有 `Running Luna Decision`，並在 ledger 檢查新的 `route`／`skills` 決策。缺少金鑰時應得到阻擋訊息。
+
+移除時，只刪除 `.codex/hooks.json` 中本工具對應的 handler；保留同檔其他 hooks，並在 `/hooks` 確認已卸載。不要刪除共用 API 金鑰或修改全域 MCP 設定。

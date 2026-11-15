@@ -189,6 +189,8 @@ CLI 啟動時會先讀取 env 檔。輸出為 JSON 寫到 stdout；錯誤寫到 
 
 | 指令 | 用途 | 參數 |
 |---|---|---|
+| `luna-core hook` | 同步 Codex UserPromptSubmit hook：嚴格路由與技能決策，失敗阻擋提示 | `--dir D`（可重複） |
+| `luna-core hook-config` | 產生本機 Codex hook 設定，不呼叫 API；安裝及信任方式見 [整合指南第 6 節](docs/integration.md#6-codex-原生-hook每次提示前強制決策) | `--dir D`、`--config FILE` |
 | `luna-core probe` | 呼叫一次 Luna（route 的固定任務），印出決策、費用與 token。需要金鑰 | — |
 | `luna-core route` | 選模型與 effort | `--task T`、`--context-tokens N`、`--requires a,b`、`--local-only` |
 | `luna-core skills` | 選要載入的 skill | `--task T`、`--dir D`（可重複） |

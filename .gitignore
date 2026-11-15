@@ -4,3 +4,6 @@ node_modules/
 .env.local
 .env.*.local
 *.jsonl
+
+# Generated host-specific absolute hook paths
+.codex/hooks.json
