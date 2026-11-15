@@ -225,7 +225,8 @@ async function runHook({ values, io }) {
     throw new UsageError('hook requires a UserPromptSubmit event');
   }
   const task = requireText(event.prompt, 'hook: prompt');
-  const config = configFor(io, values, { mode: 'luna' });
+  // Prompt hooks must ask Luna even when ordinary routing has a fixed starting model.
+  const config = configFor(io, values, { mode: 'luna', route: { start: null } });
   const engine = createEngine({ config, transport: io.transport });
   const route = await engine.route({ task });
   const skills = await engine.skills({

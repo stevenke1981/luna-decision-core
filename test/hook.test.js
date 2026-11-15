@@ -29,10 +29,10 @@ function fixture(t) {
   return { dir, skills: path.dirname(skills), fake, event, env, run };
 }
 
-test('hook forces Luna despite heuristic env/config, then injects routing and skill decisions', async (t) => {
+test('hook forces Luna despite heuristic mode and route.start, then injects routing and skill decisions', async (t) => {
   const f = fixture(t);
   const config = path.join(f.dir, 'config.json');
-  fs.writeFileSync(config, JSON.stringify({ mode: 'heuristic', skills: { dirs: [f.skills] } }));
+  fs.writeFileSync(config, JSON.stringify({ mode: 'heuristic', route: { start: { model: 'claude-haiku-5-5', effort: 'low' } }, skills: { dirs: [f.skills] } }));
   const r = await f.run(['--config', config]);
   assert.equal(r.code, EXIT.OK);
   assert.equal(r.err, '');
@@ -53,8 +53,9 @@ test('hook permits an empty skill catalog while still requiring a live routing d
   assert.deepEqual(f.fake.calls.map((c) => c.state.kind), ['route']);
 });
 
-test('missing credentials return an explicit blocking decision, not a nonblocking CLI error', async (t) => {
+test('missing credentials block even with route.start and no skill candidates', async (t) => {
   const f = fixture(t);
+  fs.writeFileSync(path.join(f.dir, 'config.json'), JSON.stringify({ route: { start: { model: 'claude-haiku-5-5', effort: 'low' } } }));
   const r = await f.run([], { env: { LUNA_CORE_HOME: f.dir }, transport: undefined });
   assert.equal(r.code, EXIT.OK);
   assert.equal(r.json().decision, 'block');

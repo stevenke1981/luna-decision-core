@@ -288,7 +288,7 @@ Windows 設定使用 `commandWindows` 及 PowerShell `-EncodedCommand`，避免 
 ### 6.2 執行與失敗行為
 
 - hook 由 host 同步執行，從 stdin 讀取 `UserPromptSubmit` JSON，先做 `route`，再做 `skills`，完成後才回傳 developer context。
-- 固定使用 `luna` 嚴格模式，覆蓋設定及環境中的 `auto`／`heuristic`；明示傳入 `--mode auto` 或 `--mode heuristic` 會被阻擋。
+- 固定使用 `luna` 嚴格模式，並在此 hook 內停用 `route.start` 固定起始策略以確保路由詢問 Luna（一般路由不變）；覆蓋設定及環境中的 `auto`／`heuristic`；明示傳入 `--mode auto` 或 `--mode heuristic` 會被阻擋。
 - 沒有金鑰、上游錯誤、低信心棄權、設定／輸入錯誤或技能決策失敗時，回傳 exit 0 與 `{"decision":"block","reason":"..."}`，由 Codex 阻擋提示。exit 0 表示 hook 回應格式有效，不表示決策通過。
 - 路由會呼叫 API；沒有技能候選時，技能決策可直接得到 `settled`，不額外花費。輸入限制為 1 MB。設定的 host timeout 為 30 秒，若自訂 API timeout 或技能批次較大，需一併調整。
 - 成功時將路由與技能結果加入 `hookSpecificOutput.additionalContext`，要求 agent 讀取選中的 `SKILL.md`。模型切換及決策採納仍由 host／agent 負責，hook 不變更模型、不擴大權限，也不攔截每次工具呼叫。
